@@ -55,6 +55,86 @@ against the reference, acceptance length, boot time.
 
 ## Runs
 
-| Run | Arm | Score | Prefill | c16 paired | c1 paired | Grid | Outputs identical |
-|---|---|---:|---:|---:|---:|---:|---|
-| `ar-20261101T055815Z-18a74fde` (reference) | stock 1030 | 100 | 6,796 / 6,835 / 6,565 tok/s | 241.9 tok/s | 77.3 tok/s | 24.75 ms | — |
+All on 2026-11-01, one session, arms cumulative in the order run. Changes are against the reference boot
+(`ar-20261101T055815Z-18a74fde`: prefill 6,796 / 6,835 / 6,565 tok/s at 32K / 128K / 256K, c16 241.9 tok/s,
+c1 77.3 tok/s, grid 24.75 ms); prefill is the geometric mean of the three sizes, c16 and c1 are paired decode,
+grid is the engine grid's decode geometric mean (negative is faster). Every boot's 64 greedy outputs were
+identical to the reference's. Logged runs 4-5 were an arm the tooling refused before boot
+(`NCCL_MIN_NCHANNELS` on a switched transport); nothing ran.
+
+| Boot | Arm (adds to the row above unless noted) | Score | Prefill | c16 | c1 | Grid |
+|---|---|---:|---:|---:|---:|---:|
+| ref | stock 1030 | 100.00 | 0 | 0 | 0 | 0 |
+| 1 | stock 1030, repeat | 100.07 | +0.23% | -0.20% | +0.01% | +0.19% |
+| 2 | direct exchange (1030-direct) | 101.54 | +3.10% | -0.01% | -0.01% | +0.58% |
+| 3 | direct exchange, repeat | 101.25 | +2.55% | +0.09% | -0.16% | +0.53% |
+| 6 | + sparknet switched NCCL profile | 101.86 | +3.81% | +0.09% | -0.18% | +0.58% |
+| 7 | repeat | 101.49 | +3.07% | +0.09% | -0.20% | -0.37% |
+| 8 | + NVFP4 draft heads, six drafts (112-row graphs) | 101.67 | +2.58% | +0.55% | +1.00% | -3.57% |
+| 9 | repeat | 101.86 | +3.03% | +0.42% | +1.00% | -3.38% |
+| 10 | + `max_num_batched_tokens` 24,576 | 102.85 | +5.00% | +0.71% | +0.78% | -3.21% |
+| 11 | repeat | 103.09 | +5.78% | +0.67% | +0.27% | -3.57% |
+| 12 | + row cost 0.01 | 103.62 | +6.12% | +0.68% | +1.68% | -3.36% |
+| 13 | repeat | 103.45 | +5.50% | +1.25% | +1.65% | -3.29% |
+| 14 | + `max_num_batched_tokens` 32,768 (from 24,576) | 104.32 | +7.90% | +0.35% | +1.37% | -3.39% |
+| 15 | repeat | 104.51 | +7.87% | +0.93% | +1.56% | -3.12% |
+| 16 | seven drafts (128-row graphs), discarded | 103.61 | +7.50% | -0.27% | -0.01% | -1.70% |
+| 17 | five drafts (96-row graphs) instead of six | 104.56 | +7.70% | +1.00% | +2.02% | -4.21% |
+| 18 | repeat: **best stack** | **104.84** | +7.94% | +1.45% | +2.22% | -4.17% |
+| 19 | best stack without the NCCL profile (ablation) | 104.07 | +6.65% | +1.14% | +1.97% | -4.60% |
+| 20 | ablation, repeat | 104.21 | +6.81% | +1.25% | +2.10% | -3.89% |
+| 21 | best stack with 16 NCCL channels, discarded | 104.86 | +8.18% | +1.13% | +2.17% | -4.59% |
+
+Best stack, boot 18: prefill 7,331 / 7,393 / 7,076 tok/s, c16 245.1 tok/s, c1 79.0 tok/s, grid 23.72 ms.
+
+Lowest `MemAvailable` during the suite (head / ranks): 21.0 / 22.5 GiB at a 16,384 budget, 18.5 / 19.9 GiB
+at 24,576, 16.4 / 17.7 GiB at 32,768.
+
+## Conclusions
+
+Each item's gain is its two boots' mean against the two boots of the arm before it. A/A between the two
+stock boots: 0.07 score; within an arm, prefill boots spread up to 0.7% and the grid ±0.5%.
+
+1. **Direct exchange (0009): proven.** Prefill +2.7% (+2.83% against +0.12%), every size; decode, grid
+   and greedy outputs unchanged. The old r6w figures (+1.1 to +3.4%) hold on this base, flatter across
+   sizes.
+2. **sparknet's switched NCCL profile: proven by ablation.** Removing it from the best stack costs 1.1%
+   prefill (+6.73% against +7.82%, each pair within 0.25%); added at a 16,384 budget it read +0.6%, inside
+   that arm's spread. Decode unchanged. Sixteen channels instead of eight add nothing beyond noise (+0.35%,
+   one boot).
+3. **NVFP4 draft heads: proven; six drafts are not.** Heads with six drafts: decode +0.8% (c1 +1.2%, c16
+   +0.4%), the grid's step 3.5% cheaper. With the heads, five drafts beat six by 0.6% decode (c1 +0.6%, c16
+   +0.6%; grid 4.2% cheaper than stock against 3.3%) and seven lose 1.2%. The old stack's k=6 does not carry
+   over: take the heads at the recipe's five drafts.
+4. **Prefill budget 24,576: proven,** +2.5 prefill points (+5.39% against +2.80%), the old figure (+2.4).
+   **32,768** adds 2.1 more (+7.88%). Each 8,192 tokens costs about 2.1-2.5 GiB of the memory floor; the
+   suite does not measure what a longer chunk step costs decode streams beside a cold long prefill (below).
+4b. **Row cost 0.01: proven,** decode +0.7% (c1 +1.15%, c16 +0.3%).
+
+All together (boot 17-18 mean against stock): prefill +7.8%, c16 +1.2%, c1 +2.1%, score 104.7.
+
+## The prefill budget's cost
+
+`stall-suite.json` (the release suite's `stall-3` and `stall-11` steps, then one cold 1M prefill) on the
+best stack at three budgets, one boot each (`arms/budget-16k.json`, `arms/budget-24k.json`, `arm.json`;
+outputs `results/private/autoresearch/stall-*` on the head):
+
+| Budget | Decode gap during a cold 131K prefill, mean (3 / 11 streams) | Longest decode stall (3 / 11) | Short-request TTFT p50 (3 / 11) | 131K prefill beside decode | 1M cold prefill | Lowest MemAvailable, head / ranks |
+|---:|---:|---:|---:|---:|---:|---:|
+| 16,384 | 1.15 / 1.19 s | 2.42 / 3.21 s | 3.63 / 2.96 s | 6,195 tok/s | 5,251 tok/s | 20.8 / 22.6 GiB |
+| 24,576 | 1.61 / 1.65 s | 3.50 / 5.52 s | 4.19 / 5.31 s | 6,450 tok/s | 5,306 tok/s | 18.1 / 19.8 GiB |
+| 32,768 | 2.21 / 2.31 s | 4.50 / 5.94 s | 5.19 / 5.82 s | 6,880 tok/s | 5,451 tok/s | 15.7 / 17.6 GiB |
+
+A 1M prompt prefills at every budget with more than 15 GiB to spare. The budget trades cold-prefill
+throughput against every stream that shares the engine with a cold long prompt: at 32,768 the decode gap
+and the short-request wait during it are about twice and one and a half times those at 16,384. Which side
+matters more is the owner's call on the production workload; 24,576 is the old recipe's point.
+
+## Not measured here
+
+- Items 5 (persistent prefix KV cache) and 6 (weight snapshots) need vLLM patches.
+- `bin/spark bench`'s live check reports `display manager is active` on all four nodes as an error, so the
+  harness benches with `--allow-mismatch` and fails on any other error. `doctor` also flags the site's
+  4 KiB kernel (the recipe pins `7.0.0-1019-nvidia-64k`), NVMe interrupt coalescing on, and NVMe APST
+  sleeping after 100 ms (11-46 ms to wake, which the Engram reader's first read after a pause waits for).
+  These are host changes for the owner; none is in any arm.
