@@ -5,6 +5,13 @@
   "shape": "tp4-switched"
  },
  "set": {
+  "upstreams_config": "experiments/2026-11-01-direct-exchange-switched/upstreams.lock.json",
+  "container": {
+   "image": "spark-ds41f:1030-direct",
+   "expected_labels": {
+    "local.spark-ds41f.vllm.tree": "6ad77da9a7ad0a8f11b7d82993b0ee73823427ce"
+   }
+  },
   "environment": {
    "NCCL_MAX_NCHANNELS": "8",
    "NCCL_BUFFSIZE": "1048576",

@@ -48,9 +48,21 @@ the direct arm is the image as built. Two boots each; changes against the first 
 - **Prefill:** +2.7% (two-boot means, +2.83% against +0.12%), at every size.
 - **Decode:** closed-loop paired decode unchanged. The engine grid reads +0.46% over boots
   (`servebench.engine.spread`, boot as the sample): ±1.05% at 95%, no detectable change.
-- **Outputs:** greedy token ids of 64 prompts (256 tokens each) identical to stock on both boots (the
-  `model` step's corpus digest; top-5 logprobs were not compared).
+- **Outputs:** greedy token ids of 64 prompts (256 tokens each) identical to stock on both boots, and every
+  teacher-forced top-20 distribution identical over 16,384 positions (KL 0, top-1 agreement 100%):
+  `python3 -m servebench compare <stock>/model.json.gz <direct>/model.json.gz` on the receipts' model steps
+  (kept on the head; `runs/` leaves them out for size).
 - Switch and HCA error counters were not read in this session.
 
-**Conclusion:** greedy token ids and prefill meet the acceptance; the top-5 logprob comparison and the switch
-and HCA counter check are still open.
+**Conclusion:** outputs (token ids and top-5 logprobs) and prefill meet the acceptance; the switch and HCA
+counter check is still open.
+
+## On upstream's candidate-29 series
+
+`vllm-candidate-29/0640-DS4.1-Exchange-directly-on-a-switched-fabric.patch` is the same change on top of
+candidate-29's vLLM series (`experiments/2026-10-26-spark-ds41f-candidate/candidate-29/vllm/series`, 0634-0639
+the switched TP3..TP8 commits). candidate-29 keeps the four-rank neighbour relay in `exchange_into` and
+`all_to_all_rows`; 0634 only extends the rank-order sum kernel to more ranks and reworded the module
+docstring, which was the one conflict (resolved by keeping its "Other world sizes exchange directly"). Checked
+2026-11-01 by applying the 71 patches after rc14 and then this one with `git am --3way` from rc14's head
+`b6de07aa`: both code hunks apply unchanged and both files compile. Not built or measured on candidate-29.

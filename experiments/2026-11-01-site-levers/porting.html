@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Site levers: what ports to spark-ds41f</title>
+<style>
+  :root { --fg:#1d2330; --muted:#5d6678; --line:#d9dee7; --card:#f6f8fb; --ok:#1a7f4b; --warn:#9a6700; --no:#a33a3a; --info:#2457a6; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e6e9ef; --muted:#9aa3b2; --line:#30384a; --card:#171c26; --ok:#4cc38a; --warn:#e3b341; --no:#f07a7a; --info:#79a6ff; }
+    body { background:#0f131a; }
+  }
+  body { font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--fg); max-width: 1040px; margin: 2rem auto; padding: 0 1.2rem; }
+  h1 { font-size: 1.6rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.2rem; margin-top: 2.2rem; border-bottom: 1px solid var(--line); padding-bottom: .3rem; }
+  .sub { color: var(--muted); margin-top: 0; }
+  code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--card); padding: 1px 4px; border-radius: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-size: 14px; }
+  th, td { border: 1px solid var(--line); padding: .45rem .6rem; text-align: left; vertical-align: top; }
+  th { background: var(--card); }
+  td.num { text-align: right; white-space: nowrap; }
+  .tag { display:inline-block; font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 10px; border: 1px solid currentColor; white-space: nowrap; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .no { color: var(--no); } .info { color: var(--info); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: .8rem; margin: 1rem 0; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: .8rem 1rem; }
+  .card b { display:block; font-size: 1.5rem; }
+  .card span { color: var(--muted); font-size: 13px; }
+  ol li, ul li { margin: .25rem 0; }
+  .note { border-left: 3px solid var(--info); background: var(--card); padding: .6rem .9rem; margin: 1rem 0; }
+</style>
+</head>
+<body>
+
+<h1>Site levers: what ports to spark-ds41f</h1>
+<p class="sub">From <code>experiments/2026-11-01-site-levers</code> and <code>experiments/2026-11-01-direct-exchange-switched</code>,
+measured 2026-11-01 on four DGX Sparks behind one switch (<code>tp4-switched</code>) against stock spark-ds41f-1030.</p>
+
+<div class="cards">
+  <div class="card"><b>104.7</b><span>best stack score, three boots (104.56 / 104.84 / 104.70); stock 1030 = 100</span></div>
+  <div class="card"><b>+7.8%</b><span>cold prefill, 32K–256K</span></div>
+  <div class="card"><b>+1.2% / +2.2%</b><span>decode at 16 streams / 1 stream (paired by prompt)</span></div>
+  <div class="card"><b>identical</b><span>greedy token ids and every top-20 distribution (KL 0) vs stock</span></div>
+</div>
+
+<h2>The short list</h2>
+<table>
+  <tr><th>#</th><th>Piece</th><th>Gain (two boots unless noted)</th><th>Kind of change</th><th>Applies to</th><th>Verdict</th></tr>
+  <tr><td>1</td><td><b>Direct exchange</b> (vLLM patch, old 0009)</td><td class="num">prefill +2.7%</td><td>vLLM patch + image build</td><td>switched shapes at TP4 only (the code is gated on <code>SPARKNET_ROCE_TOPOLOGY=direct</code>)</td><td><span class="tag ok">port</span></td></tr>
+  <tr><td>2</td><td><b>sparknet switched NCCL profile</b></td><td class="num">prefill +1.1%</td><td>config: <code>tp4-switched</code> environment</td><td>tp4-switched (other switched shapes unmeasured)</td><td><span class="tag ok">port</span></td></tr>
+  <tr><td>3</td><td><b>Drafter NVFP4 vocabulary head</b></td><td class="num">step −3.5…−4.2%, decode +0.8…+1.7%</td><td>config: one env var</td><td>measured on the switch only; the saving is in the drafter, not the fabric</td><td><span class="tag warn">port, scope decision</span></td></tr>
+  <tr><td>4</td><td><b>Row cost 0.01</b> (from 0.035)</td><td class="num">decode +0.7%</td><td>config, but recipe-wide</td><td>every shape (it is a literal in the shared <code>--speculative-config</code>)</td><td><span class="tag warn">port, scope decision</span></td></tr>
+  <tr><td>5</td><td><b>Prefill budget</b> 24,576 or 32,768</td><td class="num">prefill +2.5 / +4.6 pts</td><td>config: shape <code>sizing</code></td><td>per shape</td><td><span class="tag warn">owner tradeoff</span></td></tr>
+  <tr><td>6</td><td>Stock-overlay A/B method, suites</td><td class="num">—</td><td>experiment method</td><td>any Python-only vLLM change</td><td><span class="tag info">optional</span></td></tr>
+  <tr><td>7</td><td>Lab window publish guard on a fork's branch</td><td class="num">—</td><td>tooling fix (not written)</td><td><code>scripts/lab.py</code></td><td><span class="tag info">candidate</span></td></tr>
+</table>
+
+<h2>1. Direct exchange on a switched fabric <span class="tag ok">port</span></h2>
+<ul>
+  <li><b>What:</b> at four ranks, the rank-order reduce-scatter's chunk exchange and PyNCCL's <code>all_to_all_rows</code> relay half of the opposite rank's block through a neighbour, because a cable ring has no link between ranks two apart. Behind a switch every pair is one hop, so the patch exchanges directly when sparknet renders <code>SPARKNET_ROCE_TOPOLOGY=direct</code>. Any other topology keeps the relay.</li>
+  <li><b>Evidence:</b> prefill +2.7% at 32K, 128K and 256K; closed-loop decode unchanged; engine grid +0.46% ±1.05% over boots (no detectable change); greedy outputs and all top-20 logprob distributions identical over 16,384 positions.</li>
+  <li><b>Ready to port:</b> <code>experiments/2026-11-01-direct-exchange-switched/vllm-candidate-29/0640-…patch</code> is the same change rebased on upstream's candidate-29 series. Checked by applying candidate-29's 71 patches and then this one: one docstring conflict, resolved; code applies unchanged and compiles.</li>
+  <li><b>Still open:</b> build and measure it on candidate-29 (only measured on 1030); switch drop and HCA error counters were not read this session.</li>
+</ul>
+
+<h2>2. sparknet's switched NCCL profile <span class="tag ok">port</span></h2>
+<p><code>tp4-switched</code> inherits <code>tp4-ring</code>'s NCCL settings. sparknet's own switched recipe differs in four values:</p>
+<table>
+  <tr><th>Variable</th><th>tp4-switched today</th><th>sparknet switched</th></tr>
+  <tr><td><code>NCCL_MAX_NCHANNELS</code></td><td>4</td><td>8</td></tr>
+  <tr><td><code>NCCL_BUFFSIZE</code></td><td>4194304</td><td>1048576</td></tr>
+  <tr><td><code>NCCL_CUMEM_ENABLE</code></td><td>1</td><td>0</td></tr>
+  <tr><td><code>SPARKNET_ROCE_ALLGATHER_MAX_BYTES</code></td><td>2097152</td><td>4194304</td></tr>
+</table>
+<ul>
+  <li><b>Evidence:</b> taking it off the best stack costs 1.1% prefill (both boot pairs within 0.25%). Decode unchanged. 16 channels add nothing beyond noise.</li>
+  <li><b>How:</b> an <code>environment</code> block on the <code>tp4-switched</code> shape (shapes may set <code>environment</code>). Do not add <code>NCCL_MIN_NCHANNELS</code>: the tooling rejects it on switched transports.</li>
+</ul>
+
+<h2>3. Drafter NVFP4 vocabulary head <span class="tag warn">port, scope decision</span></h2>
+<ul>
+  <li><b>What:</b> <code>VLLM_DS41_DRAFT_NVFP4_HEAD=1</code> gives the DSpark drafter its own NVFP4 vocabulary head instead of sharing the target's. Only draft quality depends on it; target outputs stayed identical.</li>
+  <li><b>Evidence:</b> engine step 3.5–4.2% cheaper on every boot with it; removing it from the best stack puts the step back at stock and decode gains nothing.</li>
+  <li><b>Drop the rest of the old item:</b> six drafts lost 0.6% to five, seven lost 1.2%, and the NVFP4 Markov head (<code>VLLM_DS41_MARKOV_NVFP4</code>) has no measurable effect.</li>
+  <li><b>Decision:</b> put it on <code>tp4-switched</code> only, or recipe-wide after measuring <code>tp4-ring</code> and <code>tp3-triangle</code>.</li>
+</ul>
+
+<h2>4. Adaptive verification row cost 0.01 <span class="tag warn">port, scope decision</span></h2>
+<ul>
+  <li><b>Evidence:</b> decode +0.7% (1 stream +1.15%) when added at six drafts. At five drafts it is the best of 0.005, 0.01 and 0.02 (each neighbour loses about 0.8%, one boot each).</li>
+  <li><b>Catch:</b> a shape may set <code>environment</code> and <code>sizing</code>, not <code>serve_args</code>. The 0.035 is a literal inside the shared <code>--speculative-config</code>, so changing it changes every shape. Either measure it on ring and TP3 first, or add a placeholder a shape can set.</li>
+  <li><b>Not separately proven:</b> the gain was measured with the NVFP4 head on; without the head, decode is about stock.</li>
+</ul>
+
+<h2>5. Prefill budget <span class="tag warn">owner tradeoff</span></h2>
+<table>
+  <tr><th>Budget</th><th>Prefill vs stock</th><th>Decode gap beside a cold 131K prefill</th><th>Short-request TTFT p50 (3 / 11 streams)</th><th>Lowest free memory, head</th></tr>
+  <tr><td>16,384 (recipe)</td><td class="num">baseline</td><td class="num">1.15 s</td><td class="num">3.6 / 3.0 s</td><td class="num">20.8 GiB</td></tr>
+  <tr><td>24,576 (old recipe)</td><td class="num">+2.5 pts</td><td class="num">1.61 s</td><td class="num">4.2 / 5.3 s</td><td class="num">18.1 GiB</td></tr>
+  <tr><td>32,768 (serving now)</td><td class="num">+4.6 pts</td><td class="num">2.21 s</td><td class="num">5.2 / 5.8 s</td><td class="num">15.7 GiB</td></tr>
+</table>
+<p>One line in the shape's <code>sizing</code>; the long-prefill threshold re-derives on its own. A 1M prompt prefills at all three. Upstream measured the same tradeoff on the ring on 2026-10-23 and kept 16,384.</p>
+
+<h2>6–7. Method and tooling <span class="tag info">optional</span></h2>
+<ul>
+  <li><b>Stock-overlay A/B:</b> the stock arm mounted 1030's two Python files over the direct-exchange image, so both arms ran one image and no second build was needed. Works for any Python-only vLLM change.</li>
+  <li><b>Suites:</b> <code>suite.json</code> (about 21 minutes a boot: outputs, grid, c16, c1, prefill 32K–256K) and <code>stall-suite.json</code> (stall-3, stall-11, cold 1M).</li>
+  <li><b>Lab publish guard:</b> <code>lab.py window open</code> requires the commit on <code>origin/main</code>, while <code>cluster sync</code> already honours <code>deployment.branch</code>. A fork deploying another branch cannot open a window; following <code>deployment.branch</code> would fix it. Not written yet.</li>
+  <li><b>Do not port as-is:</b> <code>harness.py</code> and <code>measure.sh</code> take the window without the publish guard and hard-code this site's addresses.</li>
+</ul>
+
+<h2>Stays at the site</h2>
+<ul>
+  <li>Site configuration (<code>fe3315ad</code>: IPs, home, checkpoint path, traffic class) and <code>b01a6287</code> pointing <code>config/cluster.json</code> at the direct-exchange image.</li>
+  <li>Host fixes <code>doctor</code> asks for here: display manager off, the pinned 64 KiB-page kernel, NVMe interrupt coalescing off, NVMe APST timeouts.</li>
+</ul>
+
+<h2>Not attempted</h2>
+<ul>
+  <li>Persistent prefix KV cache (old 0008) and weight snapshots (old 0002): each needs its own vLLM patch work.</li>
+</ul>
+
+<div class="note"><b>Upstream has moved.</b> <code>upstream/main</code> is at candidate-35 (33 commits past 1030), though the promoted baseline is still 1030. Every number here is on 1030; config levers (2–5) should be re-screened on the current candidate before a promotion, and the patch (1) built on it.</div>
+
+<h2>Suggested PRs</h2>
+<ol>
+  <li><b>Direct exchange</b>: the candidate-29 patch plus both experiment records. Smallest, proven, gated to switched TP4.</li>
+  <li><b>tp4-switched configuration</b>: the NCCL profile and the drafter NVFP4 head in the shape's environment, with a qualifying run on the current candidate and a new benchmark reference.</li>
+  <li><b>Row cost</b>: an issue or PR for a per-shape placeholder, or ring/TP3 measurements to justify a recipe-wide 0.01.</li>
+  <li><b>Lab publish guard</b> following <code>deployment.branch</code>.</li>
+</ol>
+<p class="sub">Branches on the fork: <code>tp4-switched-direct-exchange</code> (the two experiment records on upstream main) and <code>site-levers-history</code> (every commit of the session).</p>
+
+</body>
+</html>
