@@ -1,6 +1,7 @@
 {
   "schema_version": 2,
   "promoted_baseline": "2026-10-30-spark-ds41f-1030",
+  "upstreams_config": "experiments/2026-11-01-direct-exchange-switched/upstreams.lock.json",
   "model": "v41-flash-1017",
   "models": {
     "v41-flash": {
@@ -28,9 +29,9 @@
   },
   "container": {
     "name": "spark-ds41f",
-    "image": "spark-ds41f:1030",
+    "image": "spark-ds41f:1030-direct",
     "expected_labels": {
-      "local.spark-ds41f.vllm.tree": "ea1281f880e7535e3d87725be0156a8e38fc2fb2",
+      "local.spark-ds41f.vllm.tree": "6ad77da9a7ad0a8f11b7d82993b0ee73823427ce",
       "local.spark-ds41f.b12x.tree": "1a647a311ca55d45070ab83d60668d9c8fb8886c",
       "local.spark-ds41f.nccl.tree": "6af10aa730a64fcee8781d62340a9c9184e79469",
       "local.spark-ds41f.tilelang.tree": "222b895d04ee6cd75179155d06e0c0d450636f51",
