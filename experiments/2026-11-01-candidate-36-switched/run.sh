@@ -82,12 +82,25 @@ detach_all "$COMMIT" || exit 1
 log "every node at ${COMMIT:0:8}"
 spark --cluster-config "$E/direct.json" cluster stop --apply --parallel || { log "FAIL: stop"; exit 1; }
 
-log "build image"
-spark --cluster-config "$E/direct.json" build image --apply || { log "FAIL: build image"; exit 1; }
-log "distribute"
-spark --cluster-config "$E/direct.json" build distribute --apply || { log "FAIL: distribute"; exit 1; }
+IMAGE=spark-ds41f:candidate-36-direct
+have=0
+for node in "${NODES[@]}"; do
+  "${SSH[@]}" "spark@$node" "docker image inspect $IMAGE > /dev/null 2>&1" && have=$((have + 1))
+done
+if [ "$have" = "${#NODES[@]}" ]; then
+  log "$IMAGE is on every node; build and distribution skipped"
+else
+  log "build image"
+  spark --cluster-config "$E/direct.json" build image --apply || { log "FAIL: build image"; exit 1; }
+  log "distribute"
+  spark --cluster-config "$E/direct.json" build distribute --apply || { log "FAIL: distribute"; exit 1; }
+fi
 
 for arm in direct stock; do
+  if [ -f "$OUT/tests-$arm/verdict.json" ]; then
+    log "release tests $arm: already run ($OUT/tests-$arm)"
+    continue
+  fi
   log "release tests: $arm"
   python3 scripts/lab.py kernel-local "$E/tests/$arm" --out "$OUT/tests-$arm" > "$OUT/tests-$arm.log" 2>&1
   log "release tests $arm: exit $? ($(tail -n 1 "$OUT/tests-$arm.log"))"

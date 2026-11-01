@@ -1,5 +1,5 @@
 {
- "notes": "Stock candidate-36 on tp4-switched: direct.json's image with candidate-36's own pynccl.py and tilelang/collectives.py (stock/, blobs 64d16a71 and b5b9fd46 of tree cc0fdf58) mounted over the direct-exchange ones, so the four-rank exchange relays through neighbours as candidate-36 does and both arms run one image.",
+ "notes": "Stock candidate-36 on tp4-switched: direct.json's image with candidate-36's own pynccl.py and tilelang/collectives.py (stock/, from the prepared vLLM series without its last patch) mounted over the direct-exchange ones, so the four-rank exchange relays through neighbours as candidate-36 does and both arms run one image.",
  "extends": {
   "config": "experiments/2026-11-01-candidate-36-switched/direct.json"
  },

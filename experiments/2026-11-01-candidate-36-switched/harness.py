@@ -160,9 +160,19 @@ class Heartbeat(threading.Thread):
 
 # ---------------------------------------------------------------- boot and cooling
 
+def same_nodes(a: dict, b: dict) -> bool:
+    """The same node set, ranks, addresses and rails. ``roce_traffic_class`` is ignored: the
+    production map carries it for the 1030 tooling, candidate-36's refuses it (its sparknet
+    sets class 106 on every switched fabric)."""
+    def strip(nodes: dict) -> dict:
+        return {**nodes, "nodes": [{k: v for k, v in node.items() if k != "roce_traffic_class"}
+                                   for node in nodes["nodes"]]}
+    return strip(a) == strip(b)
+
+
 def boot(arm: str) -> float | None:
     """lab.boot with the ready time kept: seconds from launch to ready."""
-    if spark.configuration(argparse.Namespace(cluster_config=arm))[1] != lab.nodes_config():
+    if not same_nodes(spark.configuration(argparse.Namespace(cluster_config=arm))[1], lab.nodes_config()):
         fail("the arm's node map differs from production's")
     if not lab.stop_other_engine(arm):
         fail("could not stop another engine")

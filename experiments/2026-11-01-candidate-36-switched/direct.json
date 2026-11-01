@@ -1,5 +1,5 @@
 {
- "notes": "candidate-36 with the direct exchange (vllm/series: candidate-36's series, then experiments/2026-11-01-direct-exchange-switched's patch) at tp4-switched with the recipe's NCCL settings. VLLM_SERVER_DEV_MODE=1 exposes the engine grid's collective RPC.",
+ "notes": "candidate-36 with the direct exchange (vllm/series: candidate-36's series, then experiments/2026-11-01-direct-exchange-switched's patch) at tp4-switched with the recipe's NCCL settings. VLLM_SERVER_DEV_MODE=1 exposes the engine grid's collective RPC. Its node map (config/nodes-switched-c36.local.json, a site file) is the site's switched map without roce_traffic_class, which candidate-36's tooling refuses: its sparknet marks every switched fabric's traffic with class 106 itself.",
  "extends": {
   "config": "config/cluster.json",
   "shape": "tp4-switched"
@@ -19,6 +19,7 @@
   },
   "environment": {
    "VLLM_SERVER_DEV_MODE": "1"
-  }
+  },
+  "nodes_config": "config/nodes-switched-c36.local.json"
  }
 }
