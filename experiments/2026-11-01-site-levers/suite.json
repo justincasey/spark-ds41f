@@ -1,0 +1,67 @@
+{
+ "name": "site-levers",
+ "version": 1,
+ "description": "Per-candidate screen for the 2026-11-01 site levers on tp4-switched, about 22 minutes a boot: greedy outputs on 64 prompts (identity against the reference, and heat soak), the engine grid (text-independent step cost), sixteen and one streams in closed loops (paired decode against the reference), and real-text cold prefill at 32K, 128K and 256K, three repeats each.",
+ "steps": [
+  {
+   "id": "model",
+   "command": "model",
+   "args": {
+    "limit": 64,
+    "concurrency": 16,
+    "max_tokens": 256,
+    "top": 20
+   }
+  },
+  {
+   "id": "grid",
+   "command": "engine",
+   "args": {
+    "replays": 100,
+    "settle": 1
+   }
+  },
+  {
+   "id": "c16",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 16,
+    "warmup": 60,
+    "duration": 300,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "c1",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 1,
+    "warmup": 60,
+    "duration": 300,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "prefill",
+   "command": "prefill",
+   "args": {
+    "sizes": [
+     32768,
+     131072,
+     262144
+    ],
+    "repeats": 3
+   }
+  }
+ ]
+}

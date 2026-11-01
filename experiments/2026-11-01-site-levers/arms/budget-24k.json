@@ -1,0 +1,10 @@
+{
+ "notes": "The best stack (arm.json) at a 24,576-token prefill budget (long-prefill threshold 24,576 - 96): the stall comparison's middle point.",
+ "extends": {
+  "config": "experiments/2026-11-01-site-levers/arm.json"
+ },
+ "serve_options": {
+  "--long-prefill-token-threshold": "24480",
+  "--max-num-batched-tokens": "24576"
+ }
+}

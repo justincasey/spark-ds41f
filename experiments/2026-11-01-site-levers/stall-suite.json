@@ -1,0 +1,63 @@
+{
+ "name": "site-levers-stall",
+ "version": 1,
+ "description": "The prefill budget's other side: decode streams and short requests beside a cold 131K prefill at 3 and 11 of the sixteen slots (the release suite's stall-3 and stall-11 steps), then one cold 1M prefill for the memory floor at full context.",
+ "steps": [
+  {
+   "id": "stall-3",
+   "command": "stall",
+   "args": {
+    "sizes": [
+     131072
+    ],
+    "streams": 3,
+    "max_tokens": 16384,
+    "warmup": 20,
+    "tail": 2,
+    "repeats": 3,
+    "probes": [
+     2,
+     5,
+     8,
+     11,
+     14
+    ],
+    "probe_tokens": 500,
+    "probe_max_tokens": 16
+   }
+  },
+  {
+   "id": "stall-11",
+   "command": "stall",
+   "args": {
+    "sizes": [
+     131072
+    ],
+    "streams": 11,
+    "max_tokens": 16384,
+    "warmup": 20,
+    "tail": 2,
+    "repeats": 3,
+    "probes": [
+     2,
+     5,
+     8,
+     11,
+     14
+    ],
+    "probe_tokens": 500,
+    "probe_max_tokens": 16
+   }
+  },
+  {
+   "id": "prefill-1m",
+   "command": "prefill",
+   "args": {
+    "sizes": [
+     1000000
+    ],
+    "repeats": 1
+   }
+  }
+ ]
+}
