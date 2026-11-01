@@ -63,16 +63,20 @@ reports: `test-results/<bundle>/`.
 Order: stock, direct, direct-nccl, direct-nccl, direct, stock, so drift spreads over the arms. Each
 boot cools to 50 °C and runs `suite.json`: 64 greedy outputs, the engine grid, closed loops at 16 and
 1 streams, and cold prefill at 32K, 128K and 256K (three repeats). Changes are against the first
-stock boot. The HCA counters cover the bench on all 4 nodes × 4 RDMA devices × 13 counters (208).
+stock boot. The HCA counters cover the bench on every node's switch port: each port appears as two
+PCIe functions (`rocep1s0f1`, `roceP2p1s0f1`) that read identical counters, and the `f0` functions
+are not cabled (all 208 counter files are read; the port's figures are counted once below).
 
-| Boot | Prefill 32K / 128K / 256K tok/s | Prefill | c16 paired | c1 paired | Grid | HCA errors | ECN marks |
+| Boot | Prefill 32K / 128K / 256K tok/s | Prefill | c16 paired | c1 paired | Grid | HCA errors | ECN marks (4 ports) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `c36-stock-1` (reference) | 7,241 / 7,277 / 6,948 | 0 | 0 | 0 | 21.61 ms | 0 | 99,940 |
-| `c36-stock-2` | 7,288 / 7,302 / 6,976 | +0.46% | -0.42% | -0.07% | +0.18% | 0 | 86,300 |
-| `c36-direct-1` | 7,505 / 7,553 / 7,197 | +3.67% | -0.11% | +0.09% | +0.08% | 0 | 56,960 |
-| `c36-direct-2` | 7,486 / 7,525 / 7,176 | +3.36% | -0.40% | -0.11% | -0.22% | 0 | 72,170 |
-| `c36-nccl-1` | 7,471 / 7,493 / 7,152 | +3.02% | -0.03% | +0.05% | +1.04% | 0 | 250,300 |
-| `c36-nccl-2` | 7,539 / 7,558 / 7,196 | +3.85% | -0.12% | +0.27% | +0.07% | 0 | 245,700 |
+| `c36-stock-1` (reference) | 7,241 / 7,277 / 6,948 | 0 | 0 | 0 | 21.61 ms | 0 | 49,972 |
+| `c36-stock-2` | 7,288 / 7,302 / 6,976 | +0.46% | -0.42% | -0.07% | +0.18% | 0 | 43,151 |
+| `c36-direct-1` | 7,505 / 7,553 / 7,197 | +3.67% | -0.11% | +0.09% | +0.08% | 0 | 28,479 |
+| `c36-direct-2` | 7,486 / 7,525 / 7,176 | +3.36% | -0.40% | -0.11% | -0.22% | 0 | 36,083 |
+| `c36-nccl-1` | 7,471 / 7,493 / 7,152 | +3.02% | -0.03% | +0.05% | +1.04% | 0 | 125,151 |
+| `c36-nccl-2` | 7,539 / 7,558 / 7,196 | +3.85% | -0.12% | +0.27% | +0.07% | 0 | 122,842 |
+
+`metrics.json`'s `hca_ecn_marks` sums both functions, so it is twice the column above.
 
 **Direct exchange, against stock.**
 - Prefill +3.18% at 32K, +3.43% at 128K and +3.23% at 256K (two-boot means). The arms do not
@@ -86,8 +90,8 @@ stock boot. The HCA counters cover the bench on all 4 nodes × 4 RDMA devices ×
 **NCCL profile, against direct.** Prefill +0.13% at 32K, -0.19% at 128K and -0.17% at 256K, with
 the two boots at 3.02% and 3.85%: no gain at the recipe's budget. Decode is flat. The grid read
 +1.04% on one boot and +0.07% on the other (+0.62% ±5.13 over boots, unresolved). ECN marks over the
-whole fabric rose about 3.9 times against direct (about 248,000 against 64,600 a boot), and on the
-head's ports about ten times (59,266 against 5,762 each in the first boots), with 0 errors.
+four ports rose about 3.8 times against direct (about 124,000 against 32,300 a boot), and about ten
+times on the head's port (59,266 against 5,762 in the first boots), with 0 errors.
 
 ## Conclusions
 
