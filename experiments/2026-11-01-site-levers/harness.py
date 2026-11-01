@@ -22,6 +22,7 @@ median per-request decode-rate ratio over requests both runs sent with the same 
 """
 
 import argparse
+import fcntl
 import importlib.machinery
 import importlib.util
 import json
@@ -44,6 +45,11 @@ NOTE = "autoresearch site levers"
 COOL_BELOW_C = 50
 COOL_TIMEOUT_S = 900
 PREFILL_SIZES = (32768, 131072, 262144)
+RUN_LOCK = RESULTS / ".run.lock"
+# lab's watchdog closes a window whose heartbeat is 900 s old and polls every 60 s: from
+# 840 s on, a refresh could race its production restore.
+STALE_S = 840
+RESTORE_WAIT_S = 1800
 
 _loader = importlib.machinery.SourceFileLoader("lab", str(ROOT / "scripts" / "lab.py"))
 _spec = importlib.util.spec_from_loader("lab", _loader)
@@ -62,6 +68,18 @@ def requested() -> Path | None:
     return next((r for r in (lab.REQUEST, lab.LEGACY_REQUEST) if r.exists()), None)
 
 
+def run_in_progress() -> bool:
+    """Whether a ``run`` holds RUN_LOCK (it does for its whole boot and bench)."""
+    RUN_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with RUN_LOCK.open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    return False
+
+
 # ---------------------------------------------------------------- window
 
 def window() -> None:
@@ -73,9 +91,22 @@ def window() -> None:
     request = requested()
     if request:
         fail(f"cluster requested ({request}); not taking it", 3)
+    if run_in_progress():
+        fail("another harness run holds the run lock; not touching the cluster", 3)
     hold = lab.read_hold()
     if hold and not lab.hold_is_ours(hold):
         fail(f"cluster held by {hold.get('holder')!r} since {hold.get('since')}", 3)
+    if hold and lab.heartbeat_age(hold) >= STALE_S:
+        # The watchdog (60 s poll, 900 s limit) is restoring production or about to; its
+        # restore boots for minutes before it removes the hold. Wait for that, then reopen.
+        lab.log(f"window {hold['window']} heartbeat {lab.heartbeat_age(hold):.0f} s old; waiting for the "
+                "watchdog's restore to finish")
+        deadline = time.monotonic() + RESTORE_WAIT_S
+        while lab.hold_is_ours(lab.read_hold()):
+            if time.monotonic() > deadline:
+                fail("the stale window's restore did not finish; inspect the head", 3)
+            time.sleep(15)
+        hold = None
     if hold:
         lab.beat(NOTE)
         lab.log(f"window {hold['window']} refreshed")
@@ -130,22 +161,25 @@ SITE_ERRORS = ("display manager is active",)
 
 
 def spark_cli(*arguments: str) -> tuple[int, list[str]]:
-    """bin/spark with its output kept; host warnings (and their indented corrections) are
-    counted, not printed, since they repeat for every node and every boot."""
+    """bin/spark with its output kept. Per-node host warnings (``WARN: <node>: ...``) and the
+    kernel-corrections block repeat for every node and every boot, so they are counted, not
+    printed; every other warning (a short CUDA graph ladder, for one) is printed."""
+    nodes = tuple(f"WARN: {node['name']}:" for node in lab.nodes_config()["nodes"])
     process = subprocess.Popen([sys.executable, str(ROOT / "bin" / "spark"), *arguments], cwd=ROOT, text=True,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    lines, hidden, in_warning = [], 0, False
+    lines, hidden, in_hidden = [], 0, False
     for line in process.stdout:
         line = line.rstrip("\n")
         lines.append(line)
-        in_warning = line.startswith("WARN:") or (in_warning and line.startswith("  "))
-        if in_warning or "docker run" in line:
+        starts_hidden = line.startswith(nodes) or line.startswith("WARN: Kernel corrections")
+        in_hidden = starts_hidden or (in_hidden and line.startswith("  "))
+        if in_hidden or "docker run" in line:
             hidden += 1
         else:
             print(line, flush=True)
     code = process.wait()
     if hidden:
-        print(f"({hidden} host warning lines not shown)", flush=True)
+        print(f"({hidden} per-node host warning lines not shown)", flush=True)
     return code, lines
 
 
@@ -260,6 +294,12 @@ def run(run_id: str, set_reference: bool) -> None:
     out = RESULTS / run_id
     if out.exists():
         fail(f"{out} exists")
+    RUN_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    lock = RUN_LOCK.open("a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail("another harness run holds the run lock")
     beat = Heartbeat(f"autoresearch {run_id}")
     beat.start()
     try:
@@ -291,6 +331,7 @@ def run(run_id: str, set_reference: bool) -> None:
             print(f"METRIC {name}={value:.6g}", flush=True)
     finally:
         beat.stop.set()
+        lock.close()
     request = requested()
     if request:
         lab.window_close(f"cluster requested ({request})")

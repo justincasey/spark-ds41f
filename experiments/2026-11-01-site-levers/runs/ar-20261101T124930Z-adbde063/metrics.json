@@ -1,0 +1,24 @@
+{
+ "run": "ar-20261101T124930Z-adbde063",
+ "reference": "ar-20261101T055815Z-18a74fde",
+ "metrics": {
+  "prefill_32k_tps": 7347.522685333383,
+  "prefill_128k_tps": 7409.331249705151,
+  "prefill_256k_tps": 7091.655538974807,
+  "prefill_pct": 8.176272731110647,
+  "c16_tps": 244.84666666666666,
+  "c16_paired_pct": 1.1275931527615857,
+  "c16_paired_ci95_pct": 0.5387538704445527,
+  "c1_tps": 79.0,
+  "c1_paired_pct": 2.1678511968699965,
+  "c1_paired_ci95_pct": 0.5087559896366778,
+  "decode_pct": 1.6463914220714222,
+  "score": 104.86051573689319,
+  "grid_step_ms": 23.61830978181813,
+  "grid_pct": -4.585044855487819,
+  "outputs_identical": 1.0,
+  "acceptance_length": 2.2772347357982716,
+  "boot_s": 126.8,
+  "start_gpu_c": 50
+ }
+}

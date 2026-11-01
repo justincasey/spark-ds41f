@@ -92,32 +92,47 @@ at 24,576, 16.4 / 17.7 GiB at 32,768.
 
 ## Conclusions
 
-Each item's gain is its two boots' mean against the two boots of the arm before it. A/A between the two
-stock boots: 0.07 score; within an arm, prefill boots spread up to 0.7% and the grid ±0.5%.
+Each item's gain is its two boots' mean against the two boots of the arm before it, so it is measured on the
+stack it was added to; the same lever on another stack is not measured. A/A between the two stock boots:
+0.07 score; within an arm, prefill boots spread up to 0.7% and the grid ±0.5%.
 
-1. **Direct exchange (0009): proven.** Prefill +2.7% (+2.83% against +0.12%), every size; decode, grid
-   and greedy outputs unchanged. The old r6w figures (+1.1 to +3.4%) hold on this base, flatter across
-   sizes.
+1. **Direct exchange (0009): proven.** Prefill +2.7% (+2.83% against +0.12%), every size; closed-loop decode
+   and greedy outputs unchanged. The grid read +0.46% on both direct boots; over boots
+   (`servebench.engine.spread`, Welch, boot as the sample) that is +0.46% ±1.05% against stock, and +0.23%
+   ±0.72% over all four boots that run the direct path at a 16,384 budget: no detectable decode change. The
+   old r6w figures (+1.1 to +3.4%) hold on this base, flatter across sizes.
 2. **sparknet's switched NCCL profile: proven by ablation.** Removing it from the best stack costs 1.1%
    prefill (+6.73% against +7.82%, each pair within 0.25%); added at a 16,384 budget it read +0.6%, inside
    that arm's spread. Decode unchanged. Sixteen channels instead of eight add nothing beyond noise (+0.35%,
    one boot).
-3. **NVFP4 draft heads: proven; six drafts are not.** Heads with six drafts: decode +0.8% (c1 +1.2%, c16
-   +0.4%), the grid's step 3.5% cheaper. With the heads, five drafts beat six by 0.6% decode (c1 +0.6%, c16
-   +0.6%; grid 4.2% cheaper than stock against 3.3%) and seven lose 1.2%. The old stack's k=6 does not carry
-   over: take the heads at the recipe's five drafts.
+3. **NVFP4 draft heads: gain measured; six drafts do not pay.** Heads with six drafts (row cost 0.035,
+   budget 16,384): decode +0.8% (c1 +1.2%, c16 +0.4%), the grid's step 3.5% cheaper. On the later stack (row
+   cost 0.01, budget 32,768) five drafts beat six by 0.6% decode (c1 +0.6%, c16 +0.6%; grid 4.2% cheaper than
+   stock against 3.3%) and seven lose 1.2%. The heads were never measured alone at five drafts; the grid's
+   4.2% at five drafts, where nothing else in the stack changes a fixed-row step, is the heads' step saving.
+   The old stack's k=6 does not carry over: take the heads at the recipe's five drafts.
 4. **Prefill budget 24,576: proven,** +2.5 prefill points (+5.39% against +2.80%), the old figure (+2.4).
-   **32,768** adds 2.1 more (+7.88%). Each 8,192 tokens costs about 2.1-2.5 GiB of the memory floor; the
-   suite does not measure what a longer chunk step costs decode streams beside a cold long prefill (below).
-4b. **Row cost 0.01: proven,** decode +0.7% (c1 +1.15%, c16 +0.3%).
+   **32,768** adds 2.1 more (+7.88%). Each 8,192 tokens costs about 2.1-2.5 GiB of the memory floor and
+   lengthens decode stalls beside a cold long prefill (below).
+4b. **Row cost 0.01: proven at six drafts,** decode +0.7% (c1 +1.15%, c16 +0.3%); not measured on its own at
+   five.
 
-All together (boot 17-18 mean against stock): prefill +7.8%, c16 +1.2%, c1 +2.1%, score 104.7.
+**Proven as a whole:** the best stack's two boots (17 and 18) score 104.56 and 104.84 against stock's 100.00
+and 100.07: prefill +7.8%, c16 +1.2%, c1 +2.1%. The per-item figures above sum the steps that led there.
 
 ## The prefill budget's cost
 
 `stall-suite.json` (the release suite's `stall-3` and `stall-11` steps, then one cold 1M prefill) on the
-best stack at three budgets, one boot each (`arms/budget-16k.json`, `arms/budget-24k.json`, `arm.json`;
-outputs `results/private/autoresearch/stall-*` on the head):
+best stack at three budgets, one boot each (`arms/budget-16k.json`, `arms/budget-24k.json`, `arm.json`), at
+commit `0af0d650`, inside the same window, run on the head from the checkout for each arm in turn:
+
+```sh
+python3 bin/spark --cluster-config $ARM cluster start --replace --change-shape --apply
+python3 bin/spark --cluster-config $ARM bench --suite experiments/2026-11-01-site-levers/stall-suite.json \
+  --compare none --allow-mismatch --output results/private/autoresearch/stall-$LABEL --label stall-$LABEL
+```
+
+with the hold's heartbeat refreshed every minute (`lab.beat`). Receipts: `runs/stall-*`.
 
 | Budget | Decode gap during a cold 131K prefill, mean (3 / 11 streams) | Longest decode stall (3 / 11) | Short-request TTFT p50 (3 / 11) | 131K prefill beside decode | 1M cold prefill | Lowest MemAvailable, head / ranks |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -138,3 +153,12 @@ matters more is the owner's call on the production workload; 24,576 is the old r
   4 KiB kernel (the recipe pins `7.0.0-1019-nvidia-64k`), NVMe interrupt coalescing on, and NVMe APST
   sleeping after 100 ms (11-46 ms to wake, which the Engram reader's first read after a pause waits for).
   These are host changes for the owner; none is in any arm.
+
+## Receipts
+
+`runs/<run>/` holds each boot's suite outputs as the head wrote them (`suite.json`, `conditions.json`,
+`metrics.json`, `grid.json`, `c16.json`, `c1.json` with their request tables, `prefill.json`; the model
+step's 3.8 MB text is left on the head). Run names end in the short hash of the candidate commit the nodes
+booted: the working tree committed on top of the branch head at the time, not kept on the branch. Each
+`metrics.json` records its scored metrics; the Runs table names the arm. `runs/ar-20261101T055815Z-18a74fde`
+is the reference.
