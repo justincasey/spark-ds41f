@@ -1,0 +1,22 @@
+{
+ "notes": "The site's serving profile from this experiment's findings (not a promotion: config/cluster.json is unchanged). The best stack measured here, without the engine grid's dev-mode RPC: direct exchange (spark-ds41f:1030-direct), sparknet's switched NCCL profile (at most 8 channels, 1 MiB buffers, cumem off, 4 MiB one-shot all-gather cap), NVFP4 drafter vocabulary and Markov heads at the recipe's five drafts (CUDA graphs to 96 rows), adaptive verification row cost 0.01, and a 32,768-token prefill budget (long-prefill threshold 32,768 - 96). Three boots scored 104.56 / 104.84 / 104.70 against stock 1030's 100; the budget roughly doubles decode gaps beside a cold long prefill against 16,384 (README, The prefill budget's cost).",
+ "extends": {
+  "config": "config/cluster.json",
+  "shape": "tp4-switched"
+ },
+ "set": {
+  "environment": {
+   "NCCL_MAX_NCHANNELS": "8",
+   "NCCL_BUFFSIZE": "1048576",
+   "NCCL_CUMEM_ENABLE": "0",
+   "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "4194304",
+   "VLLM_DS41_DRAFT_NVFP4_HEAD": "1",
+   "VLLM_DS41_MARKOV_NVFP4": "1"
+  }
+ },
+ "serve_options": {
+  "--speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":4,\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.01}",
+  "--long-prefill-token-threshold": "32672",
+  "--max-num-batched-tokens": "32768"
+ }
+}

@@ -84,6 +84,11 @@ identical to the reference's. Logged runs 4-5 were an arm the tooling refused be
 | 19 | best stack without the NCCL profile (ablation) | 104.07 | +6.65% | +1.14% | +1.97% | -4.60% |
 | 20 | ablation, repeat | 104.21 | +6.81% | +1.25% | +2.10% | -3.89% |
 | 21 | best stack with 16 NCCL channels, discarded | 104.86 | +8.18% | +1.13% | +2.17% | -4.59% |
+| 22 | best stack, row cost 0.005, discarded | 104.42 | +8.07% | +0.13% | +1.67% | -4.00% |
+| 23 | best stack without the drafter's NVFP4 vocabulary head (ablation) | 103.57 | +7.21% | -0.06% | +0.17% | -0.09% |
+| 24 | best stack without the NVFP4 Markov head (ablation) | 104.31 | +7.18% | +1.08% | +1.95% | -3.90% |
+| 25 | best stack, third boot | 104.70 | +7.76% | +1.31% | +2.15% | -3.74% |
+| 26 | best stack, row cost 0.02, discarded | 104.27 | +7.71% | +0.93% | +0.93% | -3.94% |
 
 Best stack, boot 18: prefill 7,331 / 7,393 / 7,076 tok/s, c16 245.1 tok/s, c1 79.0 tok/s, grid 23.72 ms.
 
@@ -117,8 +122,28 @@ stack it was added to; the same lever on another stack is not measured. A/A betw
 4b. **Row cost 0.01: proven at six drafts,** decode +0.7% (c1 +1.15%, c16 +0.3%); not measured on its own at
    five.
 
-**Proven as a whole:** the best stack's two boots (17 and 18) score 104.56 and 104.84 against stock's 100.00
-and 100.07: prefill +7.8%, c16 +1.2%, c1 +2.1%. The per-item figures above sum the steps that led there.
+**Proven as a whole:** the best stack's three boots (17, 18, 25) score 104.56, 104.84 and 104.70 (sd 0.14)
+against stock's 100.00 and 100.07: prefill +7.8%, c16 +1.2%, c1 +2.2%. The per-item figures above sum the
+steps that led there.
+
+After the five items, on the best stack, one boot each:
+
+- **Which head:** without the drafter's own NVFP4 vocabulary head the grid is back at stock (-0.09%) and
+  decode gains nothing (+0.06%); without the NVFP4 Markov head the grid is 3.9% cheaper (best stack 3.7-4.2%)
+  and decode +1.51%. The drafter head engaged (its whole saving is in the grid) and carries item 3; the
+  Markov head is inside noise. Both stay in the serving profile; the Markov head could be dropped at no
+  measurable cost.
+- **Row cost at five drafts:** 0.005 and 0.02 each lose about 0.8% decode against 0.01 (0.005 at c16,
+  0.02 at c1). 0.01 stays.
+
+## Serving profile
+
+`serving-best.json` is the best stack without `VLLM_SERVER_DEV_MODE` (its resolved serve arguments equal
+`arm.json`'s). It is this site's serving profile from these findings, booted with
+`bin/spark --cluster-config experiments/2026-11-01-site-levers/serving-best.json cluster start --replace --apply`;
+`config/cluster.json` and its baselines are unchanged, so lab windows still restore stock 1030-direct until a
+promotion. To trade cold prefill back for shorter decode stalls, set `--max-num-batched-tokens` 24,576 and
+`--long-prefill-token-threshold` 24,480 (or the recipe's 16,384 / 16,288).
 
 ## The prefill budget's cost
 
