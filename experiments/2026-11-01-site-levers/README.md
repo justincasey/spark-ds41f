@@ -28,7 +28,7 @@ Further levers enter the same way, one variable at a time, each an arm of its ow
 
 ## Harness
 
-`autoresearch.sh` (repository root) runs one measured boot of `arm.json`:
+`measure.sh` (run during the session from the repository root as `autoresearch.sh`) runs one measured boot of `arm.json`:
 
 1. `harness.py window` on the head: takes `~/spark-hold.json` (lab format, holder `spark-lab: autoresearch
    site levers`) after 30 idle seconds, or refreshes our heartbeat, and starts `scripts/lab.py watchdog`,

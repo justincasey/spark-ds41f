@@ -33,4 +33,24 @@ three long (6K-109K) prompts; 1M needle PASS.
 
 ## Runs
 
-None yet. The site deploys this build first; the stock 1030 comparison arm follows.
+Measured 2026-11-01 in `experiments/2026-11-01-site-levers` (runs and receipts there), `tp4-switched`, one
+session. Stock 1030 is the `spark-ds41f:1030-direct` image with 1030's `pynccl.py` and
+`tilelang/collectives.py` mounted over the patched ones (`overlay/stock/`, vLLM blobs `64d16a71`, `5ed772e5`);
+the direct arm is the image as built. Two boots each; changes against the first stock boot.
+
+| Boot | Arm | Prefill 32K / 128K / 256K | Prefill (geomean) | c16 paired | c1 paired | Engine grid |
+|---|---|---:|---:|---:|---:|---:|
+| ref | stock 1030 | 6,796 / 6,835 / 6,565 tok/s | 0 | 0 | 0 | 24.75 ms |
+| A/A | stock 1030 | 6,813 / 6,851 / 6,581 | +0.23% | -0.20% | +0.01% | +0.19% |
+| A | direct | 7,021 / 7,049 / 6,754 | +3.10% | -0.01% | -0.01% | +0.58% |
+| B | direct | 6,990 / 6,998 / 6,725 | +2.55% | +0.09% | -0.16% | +0.53% |
+
+- **Prefill:** +2.7% (two-boot means, +2.83% against +0.12%), at every size.
+- **Decode:** closed-loop paired decode unchanged. The engine grid reads +0.46% over boots
+  (`servebench.engine.spread`, boot as the sample): ±1.05% at 95%, no detectable change.
+- **Outputs:** greedy token ids of 64 prompts (256 tokens each) identical to stock on both boots (the
+  `model` step's corpus digest; top-5 logprobs were not compared).
+- Switch and HCA error counters were not read in this session.
+
+**Conclusion:** greedy token ids and prefill meet the acceptance; the top-5 logprob comparison and the switch
+and HCA counter check are still open.

@@ -80,6 +80,10 @@ def run_in_progress() -> bool:
     return False
 
 
+def watchdog_running() -> bool:
+    return subprocess.run(["pgrep", "-f", "lab.py watchdog"], capture_output=True).returncode == 0
+
+
 # ---------------------------------------------------------------- window
 
 def window() -> None:
@@ -97,15 +101,24 @@ def window() -> None:
     if hold and not lab.hold_is_ours(hold):
         fail(f"cluster held by {hold.get('holder')!r} since {hold.get('since')}", 3)
     if hold and lab.heartbeat_age(hold) >= STALE_S:
-        # The watchdog (60 s poll, 900 s limit) is restoring production or about to; its
-        # restore boots for minutes before it removes the hold. Wait for that, then reopen.
+        # The watchdog (60 s poll, 900 s limit) is restoring production or about to. Its
+        # restore keeps the hold when doctor --live fails, which it always does at this site
+        # (display manager), so wait for the watchdog to exit rather than for the hold to go.
         lab.log(f"window {hold['window']} heartbeat {lab.heartbeat_age(hold):.0f} s old; waiting for the "
                 "watchdog's restore to finish")
         deadline = time.monotonic() + RESTORE_WAIT_S
-        while lab.hold_is_ours(lab.read_hold()):
+        while watchdog_running():
             if time.monotonic() > deadline:
-                fail("the stale window's restore did not finish; inspect the head", 3)
+                fail("the stale window's watchdog is still running; inspect the head", 3)
             time.sleep(15)
+        label = subprocess.run(["docker", "inspect", "spark-ds41f", "--format",
+                                f'{{{{index .Config.Labels "{spark.PROFILE_LABEL}"}}}}'],
+                               text=True, capture_output=True).stdout.strip()
+        if label != lab.PRODUCTION_CONFIG:
+            fail(f"the stale window ended with {label or 'no engine'} serving, not {lab.PRODUCTION_CONFIG}; "
+                 "inspect the head", 3)
+        if lab.hold_is_ours(lab.read_hold()):
+            lab.HOLD.unlink()
         hold = None
     if hold:
         lab.beat(NOTE)

@@ -8,9 +8,10 @@
 #    published to GitHub; node checkouts stay clean and identical.
 # 3. Runs harness.py on the head, detached from this SSH session, and streams its log.
 #
+# Run from anywhere: experiments/2026-11-01-site-levers/measure.sh
 # AR_SET_REFERENCE=1 records this run as the reference (only for a stock 1030 arm).
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/../.."
 
 EXPERIMENT=experiments/2026-11-01-site-levers
 HEAD_NODE=spark@192.168.1.121
@@ -25,12 +26,12 @@ SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30)
 index=$(mktemp)
 trap 'rm -f "$index"' EXIT
 cp "$(git rev-parse --git-path index)" "$index"
-GIT_INDEX_FILE=$index git add -A -- . ':!autoresearch.jsonl' ':!.autoresearch'
+GIT_INDEX_FILE=$index git add -A -- .
 tree=$(GIT_INDEX_FILE=$index git write-tree)
 if [ "$tree" = "$(git rev-parse 'HEAD^{tree}')" ]; then
   commit=$(git rev-parse HEAD)
 else
-  commit=$(git commit-tree "$tree" -p HEAD -m "autoresearch candidate (site levers)")
+  commit=$(git commit-tree "$tree" -p HEAD -m "site levers candidate")
 fi
 echo "candidate commit $commit"
 for node in "${NODES[@]}"; do
@@ -39,7 +40,7 @@ for node in "${NODES[@]}"; do
     echo "FAIL: $node checkout is dirty:"; echo "$dirty"; exit 1
   fi
   GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=10" \
-    git push -q -f "ssh://spark@$node$REPO" "$commit:refs/autoresearch/candidate"
+    git push -q -f "ssh://spark@$node$REPO" "$commit:refs/site-levers/candidate"
   "${SSH[@]}" "spark@$node" "git -C $REPO checkout -q --detach $commit && test \$(git -C $REPO rev-parse HEAD) = $commit"
 done
 
