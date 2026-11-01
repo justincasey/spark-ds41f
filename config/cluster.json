@@ -9,9 +9,9 @@
       "notes": "DeepSeek-V4.1-Flash, revision dba1be0a (2026-09-10)."
     },
     "v41-flash-1017": {
-      "hub": "{home}/.cache/huggingface/hub",
-      "snapshot": "models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170",
-      "notes": "DeepSeek-V4.1-Flash-1017, revision 1bae0e10 (2026-10-17): new weights; config, tokenizer and tensor layout unchanged. Its blobs link on into the hub's shared store, so the hub is mounted."
+      "hub": "{home}/models",
+      "snapshot": "DeepSeek-V4.1-Flash-1017",
+      "notes": "DeepSeek-V4.1-Flash-1017, revision 1bae0e10 (2026-10-17): new weights; config, tokenizer and tensor layout unchanged. This site keeps the checkpoint as a plain local-directory download on every node ({home}/models/DeepSeek-V4.1-Flash-1017), so the models root is mounted at /hub; its Engram tables stay on local NVMe."
     }
   },
   "generation_defaults": {
@@ -64,7 +64,8 @@
     ]
   },
   "host": {
-    "home": "/home/swank",
+    "home": "/home/spark",
+    "fan_control": false,
     "memguard_gib": 3,
     "memguard_interval_seconds": 2,
     "startup_memguard_gib": 5,
@@ -197,13 +198,13 @@
     "10"
   ],
   "distributed": {
-    "master_addr": "10.0.1.71",
+    "master_addr": "192.168.1.121",
     "master_port": "9999"
   },
   "deployment": {
     "launch_enabled": true,
-    "repository": "https://github.com/christopherowen/spark-ds41f.git",
-    "branch": "main",
+    "repository": "https://github.com/justincasey/spark-ds41f.git",
+    "branch": "site",
     "path": "{home}/projects/spark-ds41f",
     "ready_url": "http://127.0.0.1:8000/v1/models",
     "ready_timeout_seconds": 3600
