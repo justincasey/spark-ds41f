@@ -475,15 +475,15 @@ list does not merge with the recipe's, it replaces it. Copying
 list, including the recipe's per-prompt image cap:
 
 ```
---limit-mm-per-prompt '{"image":4}'
+--limit-mm-per-prompt '{"image":8}'
 ```
 
-Four is the recipe's chosen per-request limit, not a limit of the model, and
+Eight is the recipe's chosen per-request limit, not a limit of the model, and
 it counts the images a chat client resends with its history. A site that
-serves more than four images in one prompt gets, on every such request:
+serves more than eight images in one prompt gets, on every such request:
 
 ```
-400: At most 4 image(s) may be provided in one prompt (parameter=image)
+400: At most 8 image(s) may be provided in one prompt (parameter=image)
 ```
 
 Write another count in that entry to raise the cap, or remove both list

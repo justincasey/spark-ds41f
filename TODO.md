@@ -591,7 +591,7 @@ preparation 24, KV setup and warmup 16, graph capture ~8 s of real work.
 ## dgx1 headroom
 
 - **Vision tower (926 MiB of BF16 weights, now tensor-parallelized).** Image
-  input is enabled (`--limit-mm-per-prompt {"image":4}`), so the tower loads.
+  input is enabled (`--limit-mm-per-prompt {"image":8}`), so the tower loads.
   `deepseek_v4_1/nvidia/vl_model.py` and `tilelang_vision.py` now shard the ViT
   (`wqkv`, `wo`, `mlp.w1`, `mlp.w2`) and aligner (`w1`, `w2`) across TP ranks
   (`use_data_parallel = is_vit_use_data_parallel()`, `False` under default
