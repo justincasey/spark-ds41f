@@ -187,6 +187,26 @@
     "tp3-triangle": "experiments/2026-10-26-spark-ds41f-candidate/rc14/rc-tp3.json",
     "tp3-switched": "experiments/2026-10-26-spark-ds41f-candidate/rc14/rc-tp3-switched.json"
   },
+  "changed_after_release": [
+    {
+      "shapes": [
+        "tp4-ring",
+        "tp4-switched",
+        "tp5-switched",
+        "tp6-switched",
+        "tp7-switched",
+        "tp8-switched",
+        "tp3-triangle",
+        "tp3-switched"
+      ],
+      "overlay": {
+        "serve_options": {
+          "--limit-mm-per-prompt": "{\"image\":8}"
+        }
+      },
+      "why": "eight images a request from 2026-11-03 (owner): a chat client resends its history, so a conversation holding a fifth image failed every later turn. The count rests on the recipe's 16 MP per-image bound and the host-side figures in experiments/2026-10-26-site-landmines (8 requests of 8 12 MP photos: 4.1 GiB; 8 requests of 32 token-max images: 4.7 GiB); its 4/8/16/32-image sweep over 1/4/8 streams is written but not run, and the startup profile stays at the batched-token bound"
+    }
+  ],
   "previous_baseline": "2026-10-25-spark-ds41f-1025",
   "hosts": {
     "os": "DGX Spark 26.09.2 (dgx-spark-ota-update-meta)",
