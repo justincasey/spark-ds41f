@@ -602,6 +602,8 @@ def render_current_state_active_settings(data: dict[str, Any]) -> str:
     nccl_u = up_map["nccl"]
     hosts = data["hosts"]
     ms = hosts.get("memory_saver", {})
+    production_args = json.loads((ROOT / "config/cluster.json").read_text())["serve_args"]
+    image_cap = production_args[production_args.index("--limit-mm-per-prompt") + 1]
 
     rows = [
         (
@@ -695,7 +697,7 @@ def render_current_state_active_settings(data: dict[str, Any]) -> str:
         ),
         (
             "Image input",
-            "TileLang vision tower loaded (`--limit-mm-per-prompt '{\"image\":4}'`, `VLLM_MAX_IMAGE_PIXELS=16777216`, `--mm-processor-cache-gb 0`; [below](#images-per-request))",
+            f"TileLang vision tower loaded (`--limit-mm-per-prompt '{image_cap}'`, `VLLM_MAX_IMAGE_PIXELS=16777216`, `--mm-processor-cache-gb 0`; [below](#images-per-request))",
         ),
         (
             "DSpark speculative decoding",

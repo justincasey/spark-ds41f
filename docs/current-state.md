@@ -283,7 +283,7 @@ rollback.
 | Page-size profiles | 64 KiB selected (`tp4-ring`, `tp3-triangle`); 4 KiB (`tp3-triangle-4k`) retains 2.2 GiB KV and a 262,144-token limit |
 | Output head & display carve-out | exact 12-bit packed BF16 (`VLLM_DS41_PACKED_BF16_LM_HEAD=1`), bit-identical to the checkpoint, with FP32 logits (`VLLM_DS41_HEAD_DTYPE=float32`); kept in regular memory on `tp4-ring` (`SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=0`) and in the GB10 display carve-out on `tp3-triangle` (`=1`) |
 | Reference precision | DeepSeek's `inference/model.py` term for term: FP32 logits, exact FP32 mHC stream projection (three TF32 parts per weight), shared expert SwiGLU in FP32 with one rounding, MoE partials rounded once per rank, and WO-A's input through `act_quant` (E4M3, UE8M0 per 32, vLLM 0177, 0179) |
-| Image input | TileLang vision tower loaded (`--limit-mm-per-prompt '{"image":4}'`, `VLLM_MAX_IMAGE_PIXELS=16777216`, `--mm-processor-cache-gb 0`; [below](#images-per-request)) |
+| Image input | TileLang vision tower loaded (`--limit-mm-per-prompt '{"image":8}'`, `VLLM_MAX_IMAGE_PIXELS=16777216`, `--mm-processor-cache-gb 0`; [below](#images-per-request)) |
 | DSpark speculative decoding | 5 draft tokens, draft TP = node count, fixed linear step cost budget (`adaptive_verification_row_cost: 0.035`, vLLM 0184, nothing timed at boot), dead verification rows below survival 0.2 (`0504`), block rejection with fresh draws per round (`0228`), sink draft-zero rejection on by default (`0221, 0223`), vocabulary-parallel greedy drafts and shard argmax verification (`0112-0114`) |
 | Collectives | sparknet 0.5.0 one-shot RoCE all-reduce (up to 2 MiB) and all-gather (`oneshot-ring4` on TP4, `oneshot-direct` on TP3), TP broadcast on one-shot all-gather (`0185`), GPU-clock timeout 10 s (`SPARKNET_ROCE_TIMEOUT_MS=10000`), no fallback (`0142`) |
 | CUDA graphs & warmup | `FULL_AND_PIECEWISE`, capture sizes 1-96 on `tp4-ring` (1-48 on `tp3-triangle`); all declared TileLang calls prepared and cache frozen before memory profiling (`--jit-monitor-mode off`) |
@@ -304,15 +304,14 @@ memory guards are unchanged.
 
 ## Images per request
 
-`--limit-mm-per-prompt {"image":4}` in the recipe's `serve_args` is the recipe's chosen
-per-request limit, set when the vision tower was enabled
-([experiments/2026-09-25-vision](../experiments/2026-09-25-vision/README.md)). It is not a
+`--limit-mm-per-prompt {"image":8}` in the recipe's `serve_args` is the recipe's chosen
+per-request limit, raised from four on 2026-11-03 by the owner. It is not a
 limit of the model. vLLM counts every image in a request, and a chat client resends its
 history, so the images retained in earlier turns count too: once a conversation holds a
-fifth image, every later turn fails with
-`400: At most 4 image(s) may be provided in one prompt`.
+ninth image, every later turn fails with
+`400: At most 8 image(s) may be provided in one prompt`.
 
-A site profile raises the limit by writing another count in that entry (`{"image":8}`), or
+A site profile raises the limit by writing another count in that entry (`{"image":16}`), or
 omits both entries to take vLLM's default of 999 per prompt. `{"image":0}` (or
 `--language-model-only`) skips the vision tower and its 0.9 GiB of weights on every rank.
 A profile's `serve_args` is the complete command, so the change is made in the profile's
@@ -321,12 +320,18 @@ own list ([setup.md](setup.md#a-site-profile-replaces-serve_args-wholesale)).
 The trade-off is memory per request, not at startup. The tower's weights load whenever
 images are allowed at all, and vLLM encodes a request's images within a per-step budget
 derived from the batched-token budget (6,144 tokens on the triangle, 16,384 on the ring), so
-the encoder's working memory per step does not grow with the count. The request does: every
-image becomes prompt tokens that hold blocks of the fixed KV pool (`kv_cache_memory_bytes`)
+the encoder's working memory per step does not grow with the count, and the startup profile
+`min(budget / 1,024, 8 streams x cap)` stays at the budget bound at a cap of eight as it did
+at four. The request does: every image becomes prompt tokens that hold blocks of the fixed KV
+pool (`kv_cache_memory_bytes`)
 for the life of the request, beside every other stream's context, and lengthen its
 prefill; and the head's API server decodes and preprocesses every image in host memory,
-which on GB10 is the unified memory dgx1's steady guard watches. No count above four is
-qualified here.
+which on GB10 is the unified memory dgx1's steady guard watches. Eight is not yet qualified
+on the cluster: the 4, 8, 16 and 32-image sweep over 1, 4 and 8 streams is written
+([experiments/2026-10-26-site-landmines](../experiments/2026-10-26-site-landmines/README.md))
+but has not run, so the count rests on the pixel bound below and on the host-side figures
+taken there (8 requests of 8 12 MP photos: 4.1 GiB; 8 requests of 32 token-max images:
+4.7 GiB).
 
 **Pixels per image: at most 16,777,216** (`VLLM_MAX_IMAGE_PIXELS` in the recipe, since
 2026-10-25). vLLM decodes every image at its source size before DS4.1 resizes it to about
@@ -340,13 +345,14 @@ on the 1025 image (experiments/2026-10-26-site-landmines):
 
 The model never sees more than about 1.7 MP, so a 16 MP limit changes nothing for ordinary
 images. Larger photos, such as 48 MP phone originals, get a 400 before decoding: vLLM reads
-the dimensions from the header and refuses the image before any pixel is decoded. A higher
-per-request image count waits for its own measurement.
+the dimensions from the header and refuses the image before any pixel is decoded. The pixel
+bound, not the count, holds the host cost of a request near 8 x 200 MiB of peak; the sweep
+above is what would state the count's own margin.
 
 Externally reported, not qualified here: a three-node TP3 site with the limit removed (r6
 image, 524,288-token context, eight sequences) completed a chat-history request with 13
 images and 104,615 prompt tokens, cold and warm, and three overlapping replays of it
-([#30](https://github.com/christopherowen/spark-ds41f/issues/30)). That shows more than four
+([#30](https://github.com/christopherowen/spark-ds41f/issues/30)). That shows more than eight
 working on that site, not that a given count is safe for every image size, workload or
 shape.
 
