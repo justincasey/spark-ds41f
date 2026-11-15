@@ -1,0 +1,160 @@
+{
+  "status": "completed_failed_image_compiler_idea_targeted_rework_pending",
+  "candidate": 42,
+  "purpose": "compiler_maintenance_and_retained_feature_preservation",
+  "base_candidate": 40,
+  "intended_variable": "TileLang refresh plus exact authored879\u2013883 fixes, explicit interaction of one runtime dependency",
+  "source_head": "454202b2ba8d0cf10b8caf434a956755e039483f",
+  "source_tree": "bae5fe12b58cdf364efeccbabc04cd08205c43b9",
+  "patchset": "8fb334c1144bb1b15f3709c50ef427f8d6248e9175f211b4d768a9e837c51465",
+  "image_digest": "sha256:70e9abba12d83b79a268574a2057b096af2b9fc5fcbc1b07364d6eb580b1a35a",
+  "controller_launched": true,
+  "gpu_runs": [
+    {
+      "kind": "new_image_build_and_failed_release_gate_only",
+      "attempt": 1,
+      "image": "sha256:70e9abba12d83b79a268574a2057b096af2b9fc5fcbc1b07364d6eb580b1a35a",
+      "steps": [
+        {
+          "log": "build-prepare.log",
+          "exit": 0,
+          "ended": "2026-11-05T20:50:14Z"
+        },
+        {
+          "log": "build-check.log",
+          "exit": 0,
+          "ended": "2026-11-05T20:50:17Z"
+        },
+        {
+          "log": "build-image.log",
+          "exit": 0,
+          "ended": "2026-11-05T20:50:20Z"
+        },
+        {
+          "log": "build-image-apply.log",
+          "exit": 0,
+          "ended": "2026-11-05T20:58:14Z"
+        },
+        {
+          "log": "gate-manifest.log",
+          "exit": 0,
+          "ended": "2026-11-05T20:58:16Z"
+        },
+        {
+          "log": "gate-bundle.log",
+          "exit": 0,
+          "ended": "2026-11-05T20:58:17Z"
+        },
+        {
+          "log": "release-tests.log",
+          "exit": 1,
+          "ended": "2026-11-05T21:33:38Z"
+        }
+      ],
+      "gate_totals": {
+        "passed": 8073,
+        "skipped": 360,
+        "failed": 1,
+        "error": 0
+      },
+      "exact_manifest_coverage": 136,
+      "failed_case": "tests/kernels/test_deepseek_v41_tilelang_iket.py::test_on_matches_off_and_keeps_its_own_cache",
+      "no_topk_feature_functional_or_timed_phases": true
+    }
+  ],
+  "source_artifacts_verified": 58,
+  "gate_assets_verified": 23,
+  "offline_controls_passed": 18,
+  "full_repository_tests": {
+    "passed": 755,
+    "skipped": 5
+  },
+  "full_linux_preparation_and_build_check": "both passed in native C42; original local missing-input failure preserved",
+  "success_criteria": "Correctness and retained features with no material incremental core/serving regression vs BOTH C40 boots; neutral maintenance performance acceptable, no speedup claim.",
+  "promotion": false,
+  "recurring_schedule": "PAUSED",
+  "official_local_tilelang_preparation": {
+    "passed": true,
+    "recursive_submodules_verified": true,
+    "source_head": "454202b2ba8d0cf10b8caf434a956755e039483f",
+    "source_tree": "bae5fe12b58cdf364efeccbabc04cd08205c43b9"
+  },
+  "queue": {
+    "observed_at": "2026-11-05T16:07:04.467819+00:00",
+    "hold": {
+      "holder": "spark-lab: owner-authorized lossless memory qualification",
+      "window": "dgx1-1793885062",
+      "since": "2026-11-05T13:24:22Z",
+      "expected_end": null,
+      "heartbeat": "2026-11-05T16:06:38Z",
+      "rule": "no GPU experiments, restarts, cluster sync or serving changes while this file exists",
+      "request": "to ask for the cluster, write /home/swank/spark-request.json; the window closes after the current job",
+      "production_config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json",
+      "current": "lossless expert-scales: suite-expert-scales-repeat-0"
+    },
+    "existing_request": null,
+    "legacy_request": null,
+    "created": true,
+    "submitted_request": {
+      "who": "copy-default-screening",
+      "why": "After the complete current lossless-memory cohort reaches its normal safe restored boundary, qualify C42 compiler maintenance with existing PR875 and879-883 correctness fixes on corrected default-enabled C40. New image/gates, both functional boots, both full metric boots, then named C36 restoration. Do not interrupt current timing, change its matrix, or repeat any old measured point.",
+      "how_long": "about5-6hours for guarded new compiler image, complete gates, both qualification boots and restoration",
+      "since": "2026-11-05T16:07:04.467838+00:00",
+      "source_commit": "a1690f3e3d289eb034c0ef3a6e9cf0da51c0cee1",
+      "source_tree": "bae5fe12b58cdf364efeccbabc04cd08205c43b9",
+      "after_window": "dgx1-1793885062",
+      "candidate": 42,
+      "purpose": "compiler_maintenance_retained_features_no_material_core_regression",
+      "experiment": "experiments/2026-11-05-compiler-live-qualification"
+    }
+  },
+  "queue_acknowledgment": "runs/preflight/queue-acknowledgment.json",
+  "queue_state": "exact_request_retained_by_holder_after_complete_current_cohort",
+  "original_queued_execution_commit": "a1690f3e3d289eb034c0ef3a6e9cf0da51c0cee1",
+  "execution_commit": "b6896b389c5bb0004e13fe9f4f941a31a60f87ca",
+  "prelaunch_control_amendment": "runs/preflight/control-packet.json: wheel-path identity portability, before any image/serving work",
+  "controller_pid": 1026892,
+  "supervisor_pid": 1026891,
+  "launch_started": "2026-11-05T20:47:17.740634+00:00",
+  "launch_evidence": "runs/2026-11-05-dgx/attempt-1/operator-setup.json",
+  "window": "dgx1-1793911677",
+  "window_opened": "2026-11-05T20:47:57Z",
+  "image_qualified": false,
+  "native_build_progress": {
+    "observed": "2026-11-05T21:05:25.014529+00:00",
+    "complete_Linux_prepare_exit": 0,
+    "complete_Linux_build_check_exit": 0,
+    "image_build_exit": 0,
+    "release_tests": "running",
+    "topk_initcheck": "pending",
+    "two_process_compiler_features": "pending",
+    "halted_guards": []
+  },
+  "serving_performance_available": false,
+  "cache_provenance_review": {
+    "status": "confirmed_gap_retained_independent_IKET_failure_rejects_stack",
+    "request": "runs/2026-11-05-dgx/attempt-1/cache-review-closure-request.json",
+    "observed": "2026-11-05T21:27:19.308288+00:00",
+    "finding": "Both old/new compiler packages identify0.1.15; gate uses existing shared cache and no library-stamp flag. Potential stale compiled-kernel reuse, not established stale binary consumption or compiler corruption. Compiler-feature processes have planned separate empty caches; their execution/pass is still pending.",
+    "action": "Normal closure requested AFTER current complete image-and-gate job, BEFORE any serving/functional/timed phase; no active image/spec/checkout or completed point changed. Do not use safe gate-resume automatically while this provenance issue remains unresolved.",
+    "review": "runs/preflight/cache-provenance-review.json",
+    "actual_stale_reuse_or_corruption_established": false,
+    "corrected_candidate": 44,
+    "corrected_experiment": "../2026-11-05-compiler-cache-qualification",
+    "algorithmic_rework_allowance_reset": false,
+    "corrected_candidate_disposition": "C44_metadata_only_source_withdrawn_unmeasured_cannot_fix_actual_IKET_failure"
+  },
+  "controller_active": false,
+  "performance_verdict": "not_measured",
+  "acceptance_verdict": "reject_C42_image_new_integration_failure_under_targeted_rework",
+  "actual_wait_exit": 1,
+  "ended": "2026-11-05T21:33:57.987646+00:00",
+  "restored": true,
+  "independent_all_rank_C36_restoration": true,
+  "resume_image_gate_permitted": false,
+  "failure_review": "runs/preflight/iket-retained-feature-review.json",
+  "failed_gate_audit": "runs/2026-11-05-dgx/attempt-1/failed-gate-audit.json",
+  "compiler_idea_disposition": "pending_one_focused_correction_of_newly_observed_IKET_regression",
+  "owner_disposition_update": "../2026-11-05-pr-screening/runs/compiler-rework-disposition.json",
+  "targeted_rework_candidate": 45
+}

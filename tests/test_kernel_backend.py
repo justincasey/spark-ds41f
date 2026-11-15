@@ -6,22 +6,20 @@ import contextlib
 import copy
 import functools
 import glob
-import importlib.machinery
-import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader("spark_kernel_backend_test", str(ROOT / "bin/spark"))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-spark = importlib.util.module_from_spec(spec)
-loader.exec_module(spark)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import spark_ds41f as spark
 kernel_backend = spark.kernel_backend
 source_labels = spark.source_labels
 
@@ -312,6 +310,25 @@ class KernelBackendTest(unittest.TestCase):
             spark.topology.set_argument(changed, flag, kernel_backend.BACKENDS["b12x"][flag])
             self.assertTrue(any(flag in e for e in kernel_backend.problems(changed)))
 
+    def test_serving_contract_refuses_retired_settings_only_for_new_sources(self):
+        cluster, lock, manifest, _ = self.ready()
+        for name in kernel_backend.RETIRED_SERVING_ENVIRONMENT:
+            cluster["environment"].pop(name, None)
+        for name in kernel_backend.RETIRED_SERVING_ENVIRONMENT:
+            for value in ("0", "1"):
+                with self.subTest(name=name, value=value):
+                    changed = copy.deepcopy(cluster)
+                    changed["environment"][name] = value
+                    old_errors = kernel_backend.source_problems(changed, lock, manifest)
+                    self.assertFalse(any(name in error for error in old_errors))
+                    current = copy.deepcopy(manifest)
+                    current["vllm"]["capabilities"].append(kernel_backend.SERVING_CONTRACT)
+                    errors = kernel_backend.source_problems(changed, lock, current)
+                    self.assertTrue(any(name in error and "retired" in error for error in errors))
+                    changed["environment"].pop(name)
+                    errors = kernel_backend.source_problems(changed, lock, current)
+                    self.assertFalse(any("retired" in error for error in errors))
+
     def test_missing_capability_fails(self):
         cluster, lock, manifest, patch = self.ready()
         manifest["vllm"]["capabilities"] = []
@@ -332,6 +349,20 @@ class KernelBackendTest(unittest.TestCase):
                     with patch:
                         # A missing label is named as an image built now carries it.
                         self.assertTrue(any(f".{name}.tree" in e for e in self.errors(cluster, lock)))
+
+    def test_lock_without_b12x_requires_omitting_b12x_tree_label(self):
+        cluster, lock, manifest, _ = self.ready()
+        labels = cluster["container"]["expected_labels"]
+        label = source_labels.key(labels, "b12x.tree")
+        labels.setdefault(label, manifest["b12x"]["expected_tree"])
+        self.assertEqual(kernel_backend.source_problems(cluster, lock, manifest), [])
+        lock["sources"].pop("b12x")
+        manifest.pop("b12x")
+        problems = kernel_backend.source_problems(cluster, lock, manifest)
+        self.assertEqual(len(problems), 1)
+        self.assertIn(label, problems[0])
+        labels.pop(label)
+        self.assertEqual(kernel_backend.source_problems(cluster, lock, manifest), [])
 
     def test_lock_without_tilelang_sources_fails(self):
         cluster, _, _, _ = self.ready()
@@ -519,7 +550,7 @@ class KernelBackendTest(unittest.TestCase):
 @functools.lru_cache(maxsize=1)
 def _experiment_configs_and_locks() -> tuple[tuple[str, dict], ...]:
     """Experiment JSON dictionaries that could be cluster profiles or upstream locks."""
-    skipped_dirs = {"results", "bundles", "release-tests", "__pycache__"}
+    skipped_dirs = {"results", "receipts", "bundles", "release-tests", "__pycache__"}
     items: list[tuple[str, dict]] = []
     for dirpath, dirnames, filenames in os.walk(ROOT / "experiments"):
         dirnames[:] = sorted(d for d in dirnames if d not in skipped_dirs)

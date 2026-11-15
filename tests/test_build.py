@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
-import importlib.machinery
-import importlib.util
+import hashlib
+import io
+import json
+import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spark"))
-spec = importlib.util.spec_from_loader("spark", loader)
-spark = importlib.util.module_from_spec(spec)
-loader.exec_module(spark)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import spark_ds41f as spark
 
 
 class BuildDirectoryTest(unittest.TestCase):
@@ -79,7 +83,7 @@ class LockWithoutB12xTest(unittest.TestCase):
         self.without = copy.deepcopy(self.lock)
         del self.without["sources"]["b12x"]
 
-    def plan(self, lock: dict) -> str:
+    def plan(self, lock: dict, max_compile_jobs=None) -> str:
         import argparse
         import contextlib
         import io
@@ -87,12 +91,16 @@ class LockWithoutB12xTest(unittest.TestCase):
 
         output = io.StringIO()
         cluster = spark.read_json("config/cluster.json")
+        if "b12x" not in lock.get("sources", {}):
+            # A profile of a lock without B12X expects no B12X tree label.
+            cluster["container"]["expected_labels"].pop("local.spark-ds41f.b12x.tree", None)
         with mock.patch.object(spark, "configuration", return_value=(cluster, None, lock)), \
                 mock.patch.object(spark, "build_problems", return_value=[]), \
                 mock.patch.object(spark, "repository_dirty", return_value=""), \
                 mock.patch.object(spark, "repository_revision", return_value="0" * 40), \
                 contextlib.redirect_stdout(output):
-            spark.command_build_image(argparse.Namespace(cluster_config="c.json", tag=None, apply=False))
+            spark.command_build_image(argparse.Namespace(cluster_config="c.json", tag=None, apply=False,
+                                                         max_compile_jobs=max_compile_jobs))
         return output.getvalue()
 
     def test_inputs_contexts_and_directory_leave_b12x_out(self) -> None:
@@ -126,6 +134,15 @@ class LockWithoutB12xTest(unittest.TestCase):
         for absent in ("b12x-source", "B12X_"):
             self.assertNotIn(absent, without)
 
+    def test_opt_in_job_cap_covers_nccl_without_changing_default(self) -> None:
+        original, capped = self.plan(self.lock), self.plan(self.lock, 2)
+        self.assertNotIn("NCCL_COMPILE_JOBS=", original)
+        self.assertIn("NCCL_COMPILE_JOBS=2", capped)
+        self.assertIn("VLLM_COMPILE_JOBS=", capped)
+        self.assertIn("TILELANG_COMPILE_JOBS=", capped)
+        self.assertIn("at most 2; sized from MemAvailable", capped)
+
+
     def test_smoke_imports_no_b12x_module_and_checks_it_is_absent(self) -> None:
         promoted, without = spark.smoke_script(self.lock), spark.smoke_script(self.without)
         compile(without, "smoke", "exec")
@@ -133,9 +150,12 @@ class LockWithoutB12xTest(unittest.TestCase):
         self.assertNotIn("find_spec", promoted)
         self.assertNotIn("b12x_mla_sparse", without)
         self.assertNotIn("b12x_roce_all_reduce", without)
-        for expected in ('find_spec("b12x") is None', "import vllm.models.deepseek_v4_1.common.engram",
+        for expected in ('find_spec("b12x") is None', "pkgutil.walk_packages(dsv41.__path__",
+                         'name == "b12x" or name.startswith("b12x.")',
                          "import vllm.models.deepseek_v4_1.nvidia.model", "import tilelang\n"):
             self.assertIn(expected, without)
+        # every module it imports by name must exist in the tree it smokes (tilelang.vocab_pack did not)
+        self.assertNotIn("vocab_pack", without)
 
     def test_only_the_b12x_stage_reads_the_b12x_context(self) -> None:
         stages = {}
@@ -144,7 +164,8 @@ class LockWithoutB12xTest(unittest.TestCase):
             code = "\n".join(line for line in block.splitlines() if not line.lstrip().startswith("#"))
             stages[header.split(" AS ")[-1] if " AS " in header else "final"] = code
         self.assertEqual([name for name, code in stages.items() if "b12x-source" in code], ["runtime"])
-        self.assertTrue(stages["runtime"].startswith("runtime-core AS runtime"))
+        # runtime-core, or a CUDA toolkit build's re-wired runtime-core (CudaToolkitTest).
+        self.assertTrue(stages["runtime"].startswith("${RUNTIME_CORE_STAGE} AS runtime"))
         self.assertTrue(stages["runtime-tilelang"].startswith("${TILELANG_BASE_STAGE} AS runtime-tilelang"))
         self.assertNotIn("b12x", stages["runtime-core"].lower())
         self.assertIn("VLLM_NATIVE_CACHE_DIR=/opt/spark-ds41f/native", stages["runtime-core"])
@@ -177,6 +198,568 @@ class LockWithoutB12xTest(unittest.TestCase):
             self.assertIn("local.spark-ds41f.vllm.tree", text)
             self.assertIn("arm notes cite vllm tree 88468fc7, expected 354fd6e6", text)
             self.assertIn("arm notes cite vLLM 0568..0636", text)
+
+
+CUDA_TOOLKIT_SOURCE = {
+    "kind": "deb",
+    "upstream": "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa",
+    "version": "13.5.37",
+    "lockfile": "requirements/cuda-13-5-sbsa.txt",
+    "role": "CUDA 13.5 toolchain and math libraries over the base image's CUDA 13.0.2",
+}
+# Plan-only `build image` commands recorded before locks could list a CUDA toolkit
+# (origin/main ed033551831): such a lock's command must not change.
+UNCHANGED_PLANS = ROOT / "tests/fixtures/build-image-plans.json"
+
+
+def rendered_plan(profile: str, lock: dict | None = None) -> list[str]:
+    """The plan-only `build image` argv for ``profile`` (a recipe at its default shape),
+    with the repository path as <repo> and a fixed deployment commit."""
+    import argparse
+    import contextlib
+    import io
+    import os
+    import shlex
+
+    raw = spark.read_json(profile)
+    shape = raw.get("default_shape") if spark.cluster_recipe.is_recipe(raw) else None
+    cluster = spark.read_cluster(profile, shape)
+    lock = lock or spark.read_json(cluster.get("upstreams_config", "upstreams.lock.json"))
+    output = io.StringIO()
+    with mock.patch.object(spark, "configuration", return_value=(cluster, None, lock)), \
+            mock.patch.object(spark, "build_problems", return_value=[]), \
+            mock.patch.object(spark, "repository_dirty", return_value=""), \
+            mock.patch.object(spark, "repository_revision", return_value="0" * 40), \
+            mock.patch.dict(os.environ), contextlib.redirect_stdout(output):
+        os.environ.pop("GITHUB_TOKEN", None)
+        code = spark.command_build_image(argparse.Namespace(
+            cluster_config=profile, tag=None, apply=False, max_compile_jobs=None))
+    assert code == 0, output.getvalue()
+    return [word.replace(str(spark.ROOT), "<repo>") for word in shlex.split(output.getvalue().splitlines()[0])]
+
+
+class CudaToolkitTest(unittest.TestCase):
+    """A lock that lists sources.cuda_toolkit builds on its toolkit's Dockerfile stage from
+    hash-verified packages; every other lock builds exactly as before, on the base image's
+    CUDA 13.0.2."""
+
+    PROFILES = ("releases/spark-ds41f-1107/cluster.json",
+                "experiments/2026-10-26-spark-ds41f-candidate/candidate-54/tp4.json")
+
+    def with_toolkit(self, lock: dict, **changes) -> dict:
+        lock = copy.deepcopy(lock)
+        lock["sources"]["cuda_toolkit"] = {**CUDA_TOOLKIT_SOURCE, **changes}
+        return lock
+
+    def test_locks_without_a_toolkit_render_the_recorded_command(self) -> None:
+        recorded = json.loads(UNCHANGED_PLANS.read_text(encoding="utf-8"))
+        self.assertEqual(sorted(recorded), sorted(self.PROFILES))
+        for profile in self.PROFILES:
+            with self.subTest(profile=profile):
+                self.assertEqual(rendered_plan(profile), recorded[profile])
+
+    def test_a_toolkit_adds_its_stages_and_context_only(self) -> None:
+        for profile in self.PROFILES:
+            cluster = spark.read_cluster(profile, "tp4-ring" if profile.startswith("releases/") else None)
+            lock = spark.read_json(cluster["upstreams_config"])
+            plain = rendered_plan(profile, lock)
+            toolkit = rendered_plan(profile, self.with_toolkit(lock))
+            plain_dir = spark.build_directory(spark.build_inputs(lock)).name
+            toolkit_dir = spark.build_directory(spark.build_inputs(self.with_toolkit(lock))).name
+            self.assertNotEqual(plain_dir, toolkit_dir)
+            with self.subTest(profile=profile):
+                for absent in ("CUDA_STAGE=", "RUNTIME_CORE_STAGE=", "cuda-toolkit-debs"):
+                    self.assertFalse(any(absent in word for word in plain), absent)
+                context = f"cuda-toolkit-debs=<repo>/.work/build/{toolkit_dir}/context/cuda-toolkit-debs"
+                added = ["--build-context", context, "--build-arg", "CUDA_STAGE=cuda-13-5",
+                         "--build-arg", "RUNTIME_CORE_STAGE=runtime-core-cuda-13-5"]
+                # The same command in the toolkit's build directory, plus its context and stages.
+                expected = [word.replace(plain_dir, toolkit_dir) for word in plain]
+                at_context = expected.index("--build-arg")
+                at_stage = expected.index("RUNTIME_STAGE=runtime-tilelang-sparknet") - 1
+                expected = (expected[:at_context] + added[:2] + expected[at_context:at_stage]
+                            + added[2:] + expected[at_stage:])
+                self.assertEqual(toolkit, expected)
+                # With B12X the TileLang runtime still builds on `runtime`, which starts
+                # from RUNTIME_CORE_STAGE.
+                self.assertIn("TILELANG_BASE_STAGE=runtime", toolkit)
+
+    def test_without_b12x_the_tilelang_runtime_builds_on_the_rewired_core(self) -> None:
+        lock = spark.read_json("upstreams.lock.json")
+        del lock["sources"]["b12x"]
+        self.assertEqual(spark.tilelang_base_stage(spark.build_inputs(lock)), "runtime-core")
+        inputs = spark.build_inputs(self.with_toolkit(lock))
+        self.assertEqual(spark.tilelang_base_stage(inputs), "runtime-core-cuda-13-5")
+        self.assertEqual(spark.cuda_stages(inputs), ("cuda-13-5", "runtime-core-cuda-13-5"))
+
+    def test_inputs_record_the_locked_packages_only_when_listed(self) -> None:
+        lock = spark.read_json("upstreams.lock.json")
+        plain, toolkit = spark.build_inputs(lock), spark.build_inputs(self.with_toolkit(lock))
+        self.assertNotIn("cuda_toolkit", plain)
+        self.assertIsNone(spark.cuda_stages(plain))
+        self.assertEqual({k: v for k, v in toolkit.items() if k != "cuda_toolkit"}, plain)
+        self.assertEqual(spark.build_contexts(toolkit), (*spark.build_contexts(plain), "cuda-toolkit-debs"))
+        debs = toolkit["cuda_toolkit"]["debs"]
+        self.assertEqual(len(debs), 23)
+        self.assertEqual(debs["cuda-nvcc-13-5_13.5.37-1_arm64.deb"]["version"], "13.5.37-1")
+        self.assertEqual(debs["libcublas-13-5_13.10.0.20-1_arm64.deb"]["size"], 528950246)
+        for name in ("cuda-toolkit-config-common", "cuda-toolkit-13-config-common"):
+            self.assertIn(f"{name}_13.5.37-1_all.deb", debs)
+        # A changed package moves the build directory.
+        changed = copy.deepcopy(toolkit)
+        changed["cuda_toolkit"]["debs"]["cccl-13-5_13.3.5.0.6-1_arm64.deb"]["sha256"] = "0" * 64
+        self.assertNotEqual(spark.build_directory(changed), spark.build_directory(toolkit))
+
+    def test_malformed_toolkit_sources_and_lockfiles_are_refused(self) -> None:
+        lock = spark.read_json("upstreams.lock.json")
+        self.assertEqual(spark.cuda_toolkit_problems(lock["sources"]), [])
+        self.assertEqual(spark.cuda_toolkit_problems(self.with_toolkit(lock)["sources"]), [])
+        for changes, message in (({"kind": "git"}, "kind must be deb"),
+                                 ({"upstream": "http://example.invalid/repo"}, "https://"),
+                                 ({"version": "13.6.0"}, "no Dockerfile stage installs CUDA '13.6.0'"),
+                                 ({"lockfile": "requirements/missing.txt"}, "missing package lock")):
+            with self.subTest(changes=changes):
+                problems = spark.cuda_toolkit_problems(self.with_toolkit(lock, **changes)["sources"])
+                self.assertTrue(any(message in problem for problem in problems), problems)
+                with self.assertRaises(SystemExit):
+                    spark.build_inputs(self.with_toolkit(lock, **changes))
+        good = (ROOT / CUDA_TOOLKIT_SOURCE["lockfile"]).read_text(encoding="utf-8")
+        nvcc = next(line for line in good.splitlines() if line.startswith("cuda-nvcc-13-5="))
+        cccl = next(line for line in good.splitlines() if line.startswith("cccl-13-5="))
+        for text, message in ((good.replace(cccl, cccl.replace("sha256:", "md5:")), "is not 'package=version"),
+                              (good.replace(cccl, cccl.replace("_arm64.deb", "_amd64.deb")), "is not cccl-13-5_"),
+                              (good.replace(cccl, cccl.replace("_13.3.5", "_../13.3.5")), "is not cccl-13-5_"),
+                              (good + cccl + "\n", "listed twice"),
+                              (good.replace(cccl, cccl.replace(" 1548150 ", " 0 ")), "has no size"),
+                              ("# no packages\n", "lists no package"),
+                              (good.replace(nvcc + "\n", ""), "must list cuda-nvcc-13-5 at 13.5.37")):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "cuda.txt"
+                path.write_text(text, encoding="utf-8")
+                with mock.patch.object(spark, "ROOT", Path(temporary)):
+                    problems = spark.cuda_toolkit_problems(self.with_toolkit(lock, lockfile="cuda.txt")["sources"])
+                self.assertTrue(any(message in problem for problem in problems), problems)
+
+    def test_doctor_reports_only_a_malformed_toolkit(self) -> None:
+        cluster = spark.read_cluster("releases/spark-ds41f-1107/cluster.json", "tp4-ring")
+        nodes = spark.read_json("config/nodes.example.json")
+        lock = spark.read_json(cluster["upstreams_config"])
+        plain = spark.local_doctor(cluster, nodes, lock)
+        self.assertEqual(spark.local_doctor(cluster, nodes, self.with_toolkit(lock)), plain)
+        broken = spark.local_doctor(cluster, nodes, self.with_toolkit(lock, kind=None, version="13.0.2"))
+        self.assertEqual([p for p in broken if p not in plain],
+                         ["cuda_toolkit: kind must be deb",
+                          "cuda_toolkit: no Dockerfile stage installs CUDA '13.0.2' (supported: 13.5.37)"])
+
+    def test_prepare_downloads_verifies_and_reuses_the_packages(self) -> None:
+        import contextlib
+        import hashlib
+        import io
+
+        payloads = {"a-13-5_1.0-1_arm64.deb": b"first package", "b-13-5_2.0-1_all.deb": b"second"}
+        debs = {name: {"package": name.split("_")[0], "version": name.split("_")[1], "size": len(data),
+                       "sha256": hashlib.sha256(data).hexdigest()} for name, data in payloads.items()}
+        inputs = {"cuda_toolkit": {"upstream": "https://repo.invalid/sbsa", "version": "13.5.37", "debs": debs}}
+        served: list[str] = []
+
+        def urlopen(url, timeout):
+            served.append(url)
+            return io.BytesIO(served_payload.get(url.rsplit("/", 1)[1], b""))
+
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(spark.urllib.request, "urlopen", urlopen), \
+                contextlib.redirect_stdout(io.StringIO()):
+            directory = Path(temporary)
+            context = directory / "context/cuda-toolkit-debs"
+            self.assertEqual(spark.cuda_deb_problems(context, inputs), ["cuda-toolkit-debs: missing"])
+            served_payload = dict(payloads)
+            spark.prepare_cuda_toolkit(directory, inputs)
+            self.assertEqual(served, [f"https://repo.invalid/sbsa/{name}" for name in sorted(payloads)])
+            self.assertEqual(spark.cuda_deb_problems(context, inputs), [])
+            # Verified packages are reused; only a changed one is downloaded again.
+            served.clear()
+            spark.prepare_cuda_toolkit(directory, inputs)
+            self.assertEqual(served, [])
+            (context / "b-13-5_2.0-1_all.deb").write_bytes(b"SECOND")
+            (context / "extra.deb").write_bytes(b"x")
+            self.assertEqual(spark.cuda_deb_problems(context, inputs),
+                             ["cuda-toolkit-debs: b-13-5_2.0-1_all.deb differs from the lock size or hash",
+                              "cuda-toolkit-debs: unlocked file extra.deb"])
+            spark.prepare_cuda_toolkit(directory, inputs)
+            self.assertEqual(served, ["https://repo.invalid/sbsa/b-13-5_2.0-1_all.deb"])
+            self.assertEqual(sorted(p.name for p in context.iterdir()), sorted(payloads))
+            # A download that differs from the lock fails and leaves the context as it was.
+            (context / "a-13-5_1.0-1_arm64.deb").unlink()
+            served_payload["a-13-5_1.0-1_arm64.deb"] = b"first packagX"
+            with self.assertRaisesRegex(SystemExit, "differs from the lock size or hash"):
+                spark.prepare_cuda_toolkit(directory, inputs)
+            self.assertEqual(sorted(p.name for p in context.iterdir()), ["b-13-5_2.0-1_all.deb"])
+            self.assertEqual([p.name for p in context.parent.iterdir()], ["cuda-toolkit-debs"])
+            # A short transfer is retried, then refused.
+            served.clear()
+            served_payload["a-13-5_1.0-1_arm64.deb"] = b"first"
+            with self.assertRaisesRegex(SystemExit, "cannot download"):
+                spark.prepare_cuda_toolkit(directory, inputs)
+            self.assertEqual(len(served), 3)
+
+    def test_prepare_only_accepts_the_toolkit_part_for_a_lock_that_lists_it(self) -> None:
+        import argparse
+
+        lock = spark.read_json("upstreams.lock.json")
+        cluster = spark.read_json("config/cluster.json")
+        with mock.patch.object(spark, "configuration", return_value=(cluster, None, lock)), \
+                self.assertRaisesRegex(SystemExit, "cuda_toolkit: not listed in the upstreams lock"):
+            spark.command_build_prepare(argparse.Namespace(cluster_config="c.json", only="cuda_toolkit", lock=False))
+
+    def test_only_the_toolkit_stages_install_or_rewire_it(self) -> None:
+        text = (ROOT / "docker/Dockerfile").read_text()
+        stages = {}
+        for block in text.split("\nFROM ")[1:]:
+            header = block.splitlines()[0]
+            code = "\n".join(line for line in block.splitlines() if not line.lstrip().startswith("#"))
+            stages[header.split(" AS ")[-1] if " AS " in header else "final"] = code
+        self.assertIn("\nARG CUDA_STAGE=base\n", text)
+        self.assertIn("\nARG RUNTIME_CORE_STAGE=runtime-core\n", text)
+        # The default is the base image itself: no instruction of its own.
+        self.assertEqual(stages["base"].strip(), "${BASE_IMAGE} AS base")
+        for name in ("vllm-native-builder", "nccl-builder", "tilelang-builder", "sparknet-builder", "runtime-core"):
+            self.assertTrue(stages[name].startswith(f"${{CUDA_STAGE}} AS {name}"), name)
+        self.assertTrue(stages["runtime-core-cuda-13-5"].startswith("runtime-core AS runtime-core-cuda-13-5"))
+        self.assertTrue(stages["runtime"].startswith("${RUNTIME_CORE_STAGE} AS runtime"))
+        self.assertEqual([name for name, code in stages.items() if "cuda-toolkit-debs" in code], ["cuda-13-5"])
+        self.assertEqual([name for name, code in stages.items() if "spark-wire-cuda-13-5" in code],
+                         ["cuda-13-5", "cuda-13-5-torch-2-16", "runtime-core-cuda-13-5"])
+        self.assertEqual([name for name, code in stages.items() if "13.5" in code],
+                         ["cuda-13-5", "runtime-core-cuda-13-5", "runtime-core-cuda-13-5-torch-2-16"])
+        self.assertNotIn("apt-get", stages["cuda-13-5"])
+        self.assertIn("dpkg -i /tmp/cuda-toolkit-debs/*.deb", stages["cuda-13-5"])
+        self.assertIn('LABEL local.spark-ds41f.cuda.version="13.5.37"', stages["runtime-core-cuda-13-5"])
+
+    def test_only_the_torch_stages_install_or_label_it(self) -> None:
+        text = (ROOT / "docker/Dockerfile").read_text()
+        stages = {}
+        for block in text.split("\nFROM ")[1:]:
+            header = block.splitlines()[0]
+            code = "\n".join(line for line in block.splitlines() if not line.lstrip().startswith("#"))
+            stages[header.split(" AS ")[-1] if " AS " in header else "final"] = code
+        for version, (toolkit, install, check) in spark.TORCH_STAGES.items():
+            self.assertTrue(stages[install].startswith(f"{spark.CUDA_TOOLKIT_STAGES[toolkit][0]} AS {install}"))
+            self.assertTrue(stages[check].startswith(f"{spark.CUDA_TOOLKIT_STAGES[toolkit][1]} AS {check}"))
+            self.assertIn("pip install --no-cache-dir --no-index --no-deps --force-reinstall", stages[install])
+            self.assertIn(f'LABEL local.spark-ds41f.torch.version="{version}"', stages[check])
+        self.assertEqual([name for name, code in stages.items() if "torch-wheels" in code],
+                         [install for _, install, _ in spark.TORCH_STAGES.values()])
+        self.assertEqual([name for name, code in stages.items() if "torch.version" in code],
+                         [check for _, _, check in spark.TORCH_STAGES.values()])
+        # The NCCL release is the lock's: the base image's unless the build passes another.
+        self.assertIn("\nARG NCCL_VERSION_CODE=23007\n", stages["runtime-core"])
+        self.assertEqual(spark.nccl_version_code({"nccl": {"tracking_ref": "refs/tags/v2.30.7-1"}}), 23007)
+        self.assertEqual(spark.nccl_version_code({"nccl": {"tracking_ref": "refs/tags/v2.32.3-1"}}), 23203)
+        self.assertEqual(spark.nccl_version_code({"nccl": {"tracking_ref": "refs/heads/main"}}), 23007)
+
+
+TORCH_SOURCE = {
+    "kind": "wheel",
+    "upstream": "https://download.pytorch.org/whl/nightly/cu135",
+    "version": "2.16.0.dev20261113+cu135",
+    "lockfile": "requirements/torch-2-16-cu135-aarch64.txt",
+    "role": "torch compiled for the lock's CUDA 13.5 toolkit",
+}
+
+
+class TorchWheelsTest(unittest.TestCase):
+    """A lock that lists sources.torch beside its CUDA toolkit installs that torch from
+    hash-verified wheels in the toolkit's stage; every other lock builds as before."""
+
+    def with_torch(self, lock: dict, toolkit: bool = True, **changes) -> dict:
+        lock = copy.deepcopy(lock)
+        if toolkit:
+            lock["sources"]["cuda_toolkit"] = dict(CUDA_TOOLKIT_SOURCE)
+        lock["sources"]["torch"] = {**TORCH_SOURCE, **changes}
+        return lock
+
+    def test_inputs_stages_and_context_follow_the_lock(self) -> None:
+        lock = spark.read_json("upstreams.lock.json")
+        del lock["sources"]["b12x"]
+        toolkit_only = self.with_torch(lock)
+        del toolkit_only["sources"]["torch"]
+        plain = spark.build_inputs(toolkit_only)
+        inputs = spark.build_inputs(self.with_torch(lock))
+        self.assertEqual({k: v for k, v in inputs.items() if k != "torch"}, plain)
+        self.assertNotEqual(spark.build_directory(inputs).name, spark.build_directory(plain).name)
+        self.assertEqual(spark.cuda_stages(inputs), ("cuda-13-5-torch-2-16", "runtime-core-cuda-13-5-torch-2-16"))
+        self.assertEqual(spark.tilelang_base_stage(inputs), "runtime-core-cuda-13-5-torch-2-16")
+        self.assertEqual(spark.build_contexts(inputs), (*spark.build_contexts(plain), "torch-wheels"))
+        wheels = inputs["torch"]["wheels"]
+        self.assertEqual(len(wheels), 22)
+        torch = wheels["torch-2.16.0.dev20261113+cu135-cp312-cp312-manylinux_2_28_aarch64.whl"]
+        self.assertEqual(torch["size"], 590730494)
+        self.assertTrue(torch["url"].startswith("https://download.pytorch.org/whl/nightly/cu135/torch-2.16.0"))
+        self.assertIn("nvidia_nccl_cu13-2.32.3-py3-none-manylinux_2_27_aarch64.whl", wheels)
+
+    def test_candidate_55_lists_it_with_the_nccl_release_it_needs(self) -> None:
+        lock = spark.read_json("experiments/2026-10-26-spark-ds41f-candidate/candidate-55/upstreams.lock.json")
+        self.assertEqual(spark.torch_problems(lock["sources"]), [])
+        inputs = spark.build_inputs(lock)
+        self.assertNotIn("torch", inputs)
+        self.assertEqual(spark.nccl_version_code(inputs), 23007)
+        self.assertEqual(spark.cuda_stages(inputs), ("cuda-13-5", "runtime-core-cuda-13-5"))
+        with_torch = self.with_torch(lock)
+        with_torch["sources"]["nccl"]["tracking_ref"] = "refs/tags/v2.32.3-1"
+        self.assertEqual(spark.torch_problems(with_torch["sources"]), [])
+        torch_inputs = spark.build_inputs(with_torch)
+        self.assertEqual(torch_inputs["torch"]["version"], "2.16.0.dev20261113+cu135")
+        self.assertEqual(spark.nccl_version_code(torch_inputs), 23203)
+        for released in ("upstreams.lock.json",
+                         "experiments/2026-10-26-spark-ds41f-candidate/candidate-54/upstreams.lock.json"):
+            self.assertNotIn("torch", spark.build_inputs(spark.read_json(released)))
+
+    def test_malformed_torch_sources_and_lockfiles_are_refused(self) -> None:
+        lock = spark.read_json("upstreams.lock.json")
+        self.assertEqual(spark.torch_problems(lock["sources"]), [])
+        self.assertEqual(spark.torch_problems(self.with_torch(lock)["sources"]), [])
+        self.assertEqual(spark.torch_problems(self.with_torch(lock, toolkit=False)["sources"]),
+                         ["torch: 2.16.0.dev20261113+cu135 is compiled for CUDA 13.5.37, "
+                          "but the lock's cuda_toolkit is None"])
+        for changes, problem in (
+            ({"kind": "deb"}, "torch: kind must be wheel"),
+            ({"upstream": "http://download.pytorch.org"}, "torch: upstream must be the https:// index"),
+            ({"version": "2.13.0+cu130"}, "torch: no Dockerfile stage installs torch '2.13.0+cu130'"),
+            ({"lockfile": "requirements/absent.txt"}, "torch: missing wheel lock requirements/absent.txt"),
+        ):
+            with self.subTest(changes=changes):
+                problems = spark.torch_problems(self.with_torch(lock, **changes)["sources"])
+                self.assertTrue(any(found.startswith(problem) for found in problems), problems)
+        good = (ROOT / TORCH_SOURCE["lockfile"]).read_text(encoding="utf-8")
+        first = next(line for line in good.splitlines() if line and not line.startswith("#"))
+        for text, problem in (
+            ("# nothing\n", "it lists no wheel"),
+            (first.replace("sha256:", "sha1:") + "\n", "line 1 is not"),
+            (first + "\n" + first + "\n", "is listed twice"),
+            ("\n".join(line for line in good.splitlines() if not line.startswith("torch-")) + "\n",
+             "must list torch at 2.16.0.dev20261113+cu135"),
+        ):
+            with self.subTest(problem=problem), tempfile.TemporaryDirectory(dir=ROOT / "requirements") as directory:
+                path = Path(directory) / "torch.txt"
+                path.write_text(text, encoding="utf-8")
+                relative = str(path.relative_to(ROOT))
+                problems = spark.torch_problems(self.with_torch(lock, lockfile=relative)["sources"])
+                self.assertTrue(any(problem in found for found in problems), problems)
+
+    def test_prepare_keeps_verified_wheels_and_refuses_a_changed_one(self) -> None:
+        payload = b"wheel"
+        record = {"size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(), "url": "https://w.invalid/a.whl"}
+        inputs = {"torch": {"version": "2.16.0.dev20261113+cu135", "wheels": {"a-1-py3-none-any.whl": record}}}
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+
+            def fetch(url, destination, wheel, **kwargs):
+                self.assertEqual((url, kwargs), (record["url"], {"context": "torch-wheels"}))
+                destination.write_bytes(payload)
+
+            with mock.patch.object(spark, "download_cuda_deb", side_effect=fetch) as download, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                spark.prepare_torch(directory, inputs)
+                spark.prepare_torch(directory, inputs)
+            self.assertEqual(download.call_count, 1)
+            context = directory / "context/torch-wheels"
+            self.assertEqual(spark.torch_wheel_problems(context, inputs), [])
+            (context / "a-1-py3-none-any.whl").write_bytes(b"other")
+            (context / "b-1-py3-none-any.whl").write_bytes(b"extra")
+            self.assertEqual(spark.torch_wheel_problems(context, inputs),
+                             ["torch-wheels: a-1-py3-none-any.whl differs from the lock size or hash",
+                              "torch-wheels: unlocked file b-1-py3-none-any.whl"])
+
+
+class BuildResourcePolicyTest(unittest.TestCase):
+    def test_cap_preserves_cpu_sizing_and_memory_floor(self) -> None:
+        with mock.patch.object(spark.os, "sched_getaffinity", return_value=set(range(24))):
+            self.assertEqual(spark.compile_jobs(64), 5)
+            self.assertEqual(spark.compile_jobs(64, 2), 2)
+            self.assertEqual(spark.compile_jobs(64, 20), 5)
+            with self.assertRaises(SystemExit):
+                spark.compile_jobs(63, 1)
+        with mock.patch.object(spark.os, "sched_getaffinity", return_value=set(range(6))):
+            self.assertEqual(spark.compile_jobs(96, 2), 1)
+
+    def test_invalid_caps_fail_before_build_configuration_or_dispatch(self) -> None:
+        import argparse
+        for cap in (0, -1, True, "2", 1.5):
+            with self.subTest(cap=cap), mock.patch.object(spark, "configuration") as configure:
+                with self.assertRaises(SystemExit):
+                    spark.command_build_image(argparse.Namespace(max_compile_jobs=cap))
+                configure.assert_not_called()
+
+    def test_cli_requires_a_positive_integer_and_keeps_default_optional(self) -> None:
+        import contextlib
+        import io
+        self.assertIsNone(spark.parser().parse_args(["build", "image"]).max_compile_jobs)
+        self.assertEqual(spark.parser().parse_args(["build", "image", "--max-compile-jobs", "2"]).max_compile_jobs, 2)
+        for value in ("0", "-1", "1.5", "bad"):
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                spark.parser().parse_args(["build", "image", "--max-compile-jobs", value])
+
+    def test_actual_build_argv_receipt_and_smoke_bind_effective_cap(self) -> None:
+        import argparse
+        import contextlib
+        import io
+        lock = spark.read_json("upstreams.lock.json")
+        inputs = spark.build_inputs(lock)
+        cluster = spark.read_json("config/cluster.json")
+        labels = {f"local.spark-ds41f.{name}.tree": inputs[name]["expected_tree"]
+                  for name in spark.build_projects(inputs)}
+        with tempfile.TemporaryDirectory() as temporary, contextlib.ExitStack() as stack:
+            root = Path(temporary)
+            directory = root / "build"
+            directory.mkdir()
+            stack.enter_context(mock.patch.object(spark, "ROOT", root))
+            lock_file = stack.enter_context((root / "build.lock").open("w"))
+            lock_path = mock.Mock(spec=Path)
+            lock_path.open.return_value = lock_file
+            stack.enter_context(mock.patch.object(spark, "BUILD_LOCK", lock_path))
+            returns = {"configuration": (cluster, None, lock), "build_inputs": inputs,
+                       "build_directory": directory, "read_json": {}, "arm_source_problems": [],
+                       "build_problems": [], "repository_dirty": "", "repository_revision": "b" * 40,
+                       "require_idle_build_host": None, "available_memory_gib": 96, "smoke_script": "pass"}
+            for name, value in returns.items():
+                stack.enter_context(mock.patch.object(spark, name, return_value=value))
+            stack.enter_context(mock.patch.object(spark.os, "sched_getaffinity", return_value=set(range(24))))
+            stack.enter_context(mock.patch.object(spark, "image_labels", side_effect=[None, {"id": "sha256:" + "a" * 64, "labels": labels}]))
+            build = stack.enter_context(mock.patch.object(spark, "run_memory_guarded", return_value=90))
+            smoke = stack.enter_context(mock.patch.object(spark, "smoke_image"))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            self.assertEqual(spark.command_build_image(argparse.Namespace(cluster_config="named.json", tag="example:capped", apply=True, max_compile_jobs=2)), 0)
+            argv = build.call_args.args[0]
+            for value in ("VLLM_COMPILE_JOBS=2", "TILELANG_COMPILE_JOBS=2", "NCCL_COMPILE_JOBS=2"):
+                self.assertIn(value, argv)
+            self.assertEqual(build.call_args.args[1], spark.BUILD_RESERVE_GIB)
+            self.assertEqual(smoke.call_args.kwargs["max_cpus"], 2)
+            receipt = json.loads(next((directory / "images").glob("*.json")).read_text())
+            self.assertEqual({k: receipt[k] for k in ("compile_jobs", "max_compile_jobs", "nccl_compile_jobs", "smoke_cpu_limit")},
+                             {"compile_jobs": 2, "max_compile_jobs": 2, "nccl_compile_jobs": 2, "smoke_cpu_limit": 2})
+
+
+
+class BuildEvidenceTest(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        root_patch = mock.patch.object(spark, "ROOT", self.root)
+        root_patch.start()
+        self.addCleanup(root_patch.stop)
+        self.relative = "experiments/candidate-99"
+        self.directory = self.root / self.relative
+        self.directory.mkdir(parents=True)
+        self.lock_path = f"{self.relative}/upstreams.lock.json"
+        self.old = "1" * 40
+        self.new = "2" * 40
+        self.write("source.json", {"vllm": {
+            "base_revision": self.new, "patch_head": self.new,
+            "expected_tree": self.new, "patchset_sha256": "old fingerprint",
+        }})
+        self.write("upstreams.lock.json", {
+            "source_manifest": f"{self.relative}/source.json",
+            "sources": {
+                "vllm": {"revision": self.new, "patch_head": self.old,
+                         "expected_tree": self.old, "patchset_sha256": "old fingerprint"},
+                "nccl": {"revision": self.old},
+            },
+        })
+
+    def write(self, name: str, value: dict) -> Path:
+        path = self.directory / name
+        path.write_text(json.dumps(value, indent=1) + "\n")
+        return path
+
+    def test_refresh_keeps_result_identity_and_verdict_bytes(self) -> None:
+        results = self.write("results.json", {
+            "patch_head": self.old, "expected_tree": self.old,
+            "patchset_sha256": "measured fingerprint", "total_patches": 10,
+            "image_digest": "sha256:measured-image",
+            "kernel_local_verdict": {"passed": True, "seconds": 191.06},
+        })
+        verdict = self.write("verdict.json", {"passed": True, "image": "sha256:measured-image"})
+        before = {path: path.read_bytes() for path in (results, verdict)}
+
+        updated = spark.sync_lock_and_arms(self.lock_path)
+
+        for path, contents in before.items():
+            self.assertEqual(path.read_bytes(), contents)
+            self.assertNotIn(path.relative_to(self.root).as_posix(), updated)
+        # The new inputs still advance, so the old receipt remains visibly different.
+        lock = json.loads((self.directory / "upstreams.lock.json").read_text())
+        self.assertEqual(lock["sources"]["vllm"]["expected_tree"], self.new)
+        self.assertNotEqual(json.loads(results.read_text())["expected_tree"],
+                            lock["sources"]["vllm"]["expected_tree"])
+
+    def test_sibling_receipt_notes_are_not_treated_as_arm_configuration(self) -> None:
+        notes = f"Measured vLLM patch head {self.old[:8]}, tree {self.old[:8]}."
+        receipt = self.write("results.json", {
+            "notes": notes, "container": {"expected_labels": {
+                "local.spark-ds41f.vllm.tree": self.old,
+            }}, "serve_args": [], "passed": True,
+        })
+        verdict = self.write("verdict.json", {"notes": notes, "passed": True})
+        measurements = self.write("measurements.json", {"notes": notes, "seconds": 191.06})
+        before = {path: path.read_bytes() for path in (receipt, verdict, measurements)}
+        arm = self.write("tp3.json", {
+            "notes": notes, "upstreams_config": self.lock_path, "serve_args": [],
+            "container": {"expected_labels": {"local.spark-ds41f.vllm.tree": self.old}},
+        })
+        overlay = self.write("tp3-dev.json", {
+            "notes": notes, "extends": {"config": f"{self.relative}/tp3.json"},
+        })
+
+        updated = spark.sync_lock_and_arms(self.lock_path)
+
+        for path, contents in before.items():
+            self.assertEqual(path.read_bytes(), contents)
+            self.assertNotIn(path.relative_to(self.root).as_posix(), updated)
+        for path in (arm, overlay):
+            self.assertIn(path.relative_to(self.root).as_posix(), updated)
+            self.assertIn(self.new[:8], json.loads(path.read_text())["notes"])
+        self.assertEqual(json.loads(arm.read_text())["container"]["expected_labels"]
+                         ["local.spark-ds41f.vllm.tree"], self.new)
+
+    def test_overlay_refresh_updates_nested_labels_and_respects_its_lock(self) -> None:
+        notes = f"vLLM patch head {self.old[:8]}, tree {self.old[:8]}."
+        overlay = {
+            "notes": notes, "extends": {"config": "releases/previous/cluster.json"},
+            "set": {"upstreams_config": self.lock_path,
+                    "container": {"expected_labels": {"local.spark-ds41f.vllm.tree": self.old}}},
+        }
+        current = self.write("tp3.json", overlay)
+        other = copy.deepcopy(overlay)
+        other["set"]["upstreams_config"] = "experiments/another/upstreams.lock.json"
+        unrelated = self.write("tp3-other.json", other)
+        before = unrelated.read_bytes()
+
+        updated = spark.sync_lock_and_arms(
+            self.lock_path, arm_paths=[unrelated.relative_to(self.root).as_posix()])
+
+        refreshed = json.loads(current.read_text())
+        self.assertIn(current.relative_to(self.root).as_posix(), updated)
+        self.assertEqual(refreshed["set"]["container"]["expected_labels"]
+                         ["local.spark-ds41f.vllm.tree"], self.new)
+        self.assertIn(self.new[:8], refreshed["notes"])
+        self.assertEqual(unrelated.read_bytes(), before)
+        self.assertNotIn(unrelated.relative_to(self.root).as_posix(), updated)
+
+
+class PackageStructureTest(unittest.TestCase):
+    def test_spark_ds41f_submodules_and_thin_entrypoints(self) -> None:
+        from spark_ds41f import bench, build, cli, cluster, config, doctor, lab
+
+        self.assertTrue(callable(cli.main))
+        self.assertTrue(callable(config.read_cluster))
+        self.assertTrue(callable(doctor.local_doctor))
+        self.assertTrue(callable(build.build_inputs))
+        self.assertTrue(callable(cluster.deployment_order))
+        self.assertTrue(callable(bench.command_bench))
+        self.assertTrue(callable(lab.kernel_local))
+        self.assertLessEqual(len((ROOT / "bin" / "spark").read_text().splitlines()), 15)
+        self.assertLessEqual(len((ROOT / "scripts" / "lab.py").read_text().splitlines()), 15)
+        self.assertTrue((ROOT / "pyproject.toml").is_file())
 
 
 if __name__ == "__main__":

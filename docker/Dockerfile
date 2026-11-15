@@ -8,6 +8,14 @@
 # commits after it with no native-source changes in between, so only the two
 # stable CUDA extensions are rebuilt from the overlaid source.
 ARG BASE_IMAGE=docker.io/vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e1e4b2f9788b64afa90fa41c1ff12d29cf
+# The stage every builder stage and runtime-core start from: `base`, the base image
+# and its CUDA 13.0.2, unless the lock lists sources.cuda_toolkit; `bin/spark build
+# image` then selects that toolkit's stage (`cuda-13-5`), passes its hash-verified
+# packages as the cuda-toolkit-debs context, and sets RUNTIME_CORE_STAGE to the stage
+# that re-wires and checks the toolkit on runtime-core (`runtime-core-cuda-13-5`).
+# Without a toolkit neither argument is passed and BuildKit builds neither stage.
+ARG CUDA_STAGE=base
+ARG RUNTIME_CORE_STAGE=runtime-core
 # The image is the `runtime` stage unless the lock lists the TileLang sources;
 # `bin/spark build image` then selects `runtime-tilelang`, or
 # `runtime-tilelang-sparknet` when the lock also lists sparknet. BuildKit
@@ -15,11 +23,80 @@ ARG BASE_IMAGE=docker.io/vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e
 # builds TileLang nor needs its contexts, and its layers are unchanged.
 ARG RUNTIME_STAGE=runtime
 # The stage the TileLang runtime builds on: `runtime` (with B12X) while the lock
-# lists B12X, `runtime-core` once it does not; a build without B12X then needs
-# no b12x-source context.
+# lists B12X, `runtime-core` (`runtime-core-cuda-13-5` in a CUDA 13.5 build) once it
+# does not; a build without B12X then needs no b12x-source context.
 ARG TILELANG_BASE_STAGE=runtime
 
-FROM ${BASE_IMAGE} AS vllm-native-builder
+# The base image as it is: CUDA 13.0.2 (nvcc/ptxas 13.0.88, libcublasLt 13.1.1.3).
+FROM ${BASE_IMAGE} AS base
+
+# CUDA 13.5 (nvcc/ptxas 13.5.37, libcudart 13.5.37, libcublasLt 13.10.0.20) over the
+# base image's CUDA 13.0.2, from the lock's packages (requirements/cuda-13-5-sbsa.txt,
+# verified by `bin/spark build prepare`). dpkg installs exactly that set with no
+# network access, so a dependency the set lacks fails the build. /usr/local/cuda,
+# /usr/local/cuda-13 and the pip nvidia/cu13 directory, which libtorch_cuda.so's
+# DT_RPATH and cuda.pathfinder search ahead of /usr/local/cuda, are wired to
+# /usr/local/cuda-13.5; nvcc reads TOP from its nvcc.profile because it does not
+# resolve the nvidia/cu13/bin link it may be called through.
+FROM ${BASE_IMAGE} AS cuda-13-5
+
+USER root
+
+ENV CUDA_HOME=/usr/local/cuda \
+    CUDA_VERSION=13.5.0 \
+    NV_CUDA_CUDART_VERSION=13.5.37-1 \
+    NV_CUDA_LIB_VERSION=13.5.0-1 \
+    NV_LIBCUBLAS_VERSION=13.10.0.20-1 \
+    PATH=/usr/local/cuda-13.5/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LD_LIBRARY_PATH=/usr/local/cuda-13.5/targets/sbsa-linux/lib:/usr/local/cuda/targets/sbsa-linux/lib:/usr/local/cuda/lib64
+
+RUN --mount=type=bind,from=cuda-toolkit-debs,target=/tmp/cuda-toolkit-debs \
+    set -eux; \
+    DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/cuda-toolkit-debs/*.deb; \
+    test -z "$(dpkg --audit)"; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'set -eux' \
+      'ln -sfn /usr/local/cuda-13.5 /usr/local/cuda' \
+      'ln -sfn /usr/local/cuda-13.5 /usr/local/cuda-13' \
+      'ln -sfn /usr/local/cuda-13.5 /etc/alternatives/cuda' \
+      'ln -sfn /usr/local/cuda-13.5 /etc/alternatives/cuda-13' \
+      'sed -i "s|^TOP[[:space:]]*=.*|TOP = /usr/local/cuda-13.5|" /usr/local/cuda-13.5/bin/nvcc.profile' \
+      'cu13_dir=/usr/local/lib/python3.12/dist-packages/nvidia/cu13' \
+      'cuda_lib=/usr/local/cuda-13.5/targets/sbsa-linux/lib' \
+      'rm -rf "${cu13_dir}/bin" "${cu13_dir}/nvvm"' \
+      'ln -s /usr/local/cuda-13.5/bin "${cu13_dir}/bin"' \
+      'ln -s /usr/local/cuda-13.5/nvvm "${cu13_dir}/nvvm"' \
+      'for lib in libcublas.so.13 libcublasLt.so.13 libnvblas.so.13 libcudart.so.13 libcudart_static.a libcudadevrt.a libnvJitLink.so.13 libnvrtc.so.13 libnvrtc-builtins.so.13.5 libnvptxcompiler_static.a libcurand.so.10; do' \
+      '  ln -sfn "${cuda_lib}/${lib}" "${cu13_dir}/lib/${lib}"' \
+      'done' \
+      'rm -f "${cu13_dir}/lib/libnvrtc-builtins.so.13.0" "${cu13_dir}/lib/libnvrtc-builtins.so.13.2"' \
+      'ln -sfn /usr/local/cuda-13.5/nvvm/lib64/libnvvm.so.4.0.0 "${cu13_dir}/lib/libnvvm.so.4"' \
+      'ldconfig' \
+      > /usr/local/sbin/spark-wire-cuda-13-5; \
+    chmod 0755 /usr/local/sbin/spark-wire-cuda-13-5; \
+    /usr/local/sbin/spark-wire-cuda-13-5
+
+# torch 2.16.0.dev20261113+cu135 over the CUDA 13.5 stage, from the lock's wheels
+# (requirements/torch-2-16-cu135-aarch64.txt, verified by `bin/spark build prepare`):
+# torch, every package it requires at the version it requires, and the torchvision,
+# torchaudio and torchcodec builds of its date. pip installs exactly that set, with no
+# index and no dependency resolution, so a wheel the set lacks fails the import below.
+# The set's NCCL is the stock release torch was compiled against; runtime-core replaces
+# it with the patched build of the lock's NCCL, which must be that release. The set's
+# CUDA libraries are this toolkit's own versions, and nvidia/cu13 is wired to
+# /usr/local/cuda-13.5 again so one copy is what torch, nvcc and cuda.pathfinder resolve.
+# Every builder stage starts here, so each native extension is built against this torch.
+FROM cuda-13-5 AS cuda-13-5-torch-2-16
+
+RUN --mount=type=bind,from=torch-wheels,target=/tmp/torch-wheels \
+    set -eux; \
+    python3 -m pip install --no-cache-dir --no-index --no-deps --force-reinstall \
+      /tmp/torch-wheels/*.whl; \
+    /usr/local/sbin/spark-wire-cuda-13-5; \
+    python3 -c 'import torch, torchaudio, torchvision; assert torch.__version__ == "2.16.0.dev20261113+cu135", torch.__version__'
+
+FROM ${CUDA_STAGE} AS vllm-native-builder
 
 USER root
 
@@ -82,7 +159,7 @@ RUN --mount=type=secret,id=github_token,required=false \
 # NCCL 2.30.7 (the base image's nvidia-nccl-cu13 wheel), rebuilt from the
 # pinned release tag with patches/nccl for SM121 only. The runtime stage
 # replaces the wheel's libnccl.so.2 with it.
-FROM ${BASE_IMAGE} AS nccl-builder
+FROM ${CUDA_STAGE} AS nccl-builder
 
 USER root
 
@@ -103,7 +180,7 @@ RUN set -eux; \
 # the base image's z3-solver, which TileLang links and loads at run time.
 # TileKernels takes its version from setuptools-scm, which an export without
 # Git metadata cannot supply.
-FROM ${BASE_IMAGE} AS tilelang-builder
+FROM ${CUDA_STAGE} AS tilelang-builder
 
 USER root
 
@@ -129,7 +206,7 @@ RUN set -eux; \
 # sparknet (christopherowen/dgx-spark-networking): the one-shot RoCE
 # collectives vendored from B12X with spark's patches 0001-0011, used by the
 # TileLang family instead of b12x.comm.roce. Pure Python plus a C proxy.
-FROM ${BASE_IMAGE} AS sparknet-builder
+FROM ${CUDA_STAGE} AS sparknet-builder
 
 COPY --from=sparknet-source . /workspace/sparknet/
 RUN python3 -m pip wheel --no-cache-dir --no-deps --wheel-dir /opt/sparknet /workspace/sparknet && \
@@ -139,7 +216,11 @@ RUN python3 -m pip wheel --no-cache-dir --no-deps --wheel-dir /opt/sparknet /wor
 # rebuilt native extensions, the patched NCCL and the hash-locked CuTe DSL wheels.
 # While the lock lists B12X (spark-ds41f-1025 and earlier), `runtime` adds it on
 # top; a lock without it builds the TileLang runtime on this stage directly.
-FROM ${BASE_IMAGE} AS runtime-core
+FROM ${CUDA_STAGE} AS runtime-core
+
+# No usage reporting: vLLM's usage stats (stats.vllm.ai) stay off in every image and
+# every container started from it, whatever the deployment's environment.
+ENV VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1
 
 ARG BASE_IMAGE_NAME=unrecorded
 ARG BASE_IMAGE_DIGEST=unrecorded
@@ -154,6 +235,9 @@ ARG NCCL_REVISION=unrecorded
 ARG NCCL_PATCH_HEAD=unrecorded
 ARG NCCL_TREE=unrecorded
 ARG DEPLOYMENT_COMMIT=uncommitted
+# NCCL_VERSION_CODE of the lock's NCCL tag; `bin/spark build image` passes it when the
+# lock tracks another release than the base image's 2.30.7.
+ARG NCCL_VERSION_CODE=23007
 
 LABEL org.opencontainers.image.source="https://github.com/christopherowen/spark-ds41f" \
       org.opencontainers.image.revision="${DEPLOYMENT_COMMIT}" \
@@ -249,6 +333,7 @@ RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs python3 - <<'PY'
 import ctypes
 import hashlib
 import importlib.metadata as metadata
+import os
 import subprocess
 
 assert metadata.version("nvidia-cutlass-dsl") == "4.7.1"
@@ -262,7 +347,7 @@ from vllm.models.deepseek_v4_1.engram_rows import _native as engram_native
 nccl = "/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2"
 version = ctypes.c_int()
 assert ctypes.CDLL(nccl).ncclGetVersion(ctypes.byref(version)) == 0
-assert version.value == 23007, version.value
+assert version.value == int(os.environ["NCCL_VERSION_CODE"]), version.value
 with open(nccl, "rb") as handle:
     built = open("/opt/spark-ds41f/nccl/libnccl.so.2.sha256").read().strip()
     assert hashlib.sha256(handle.read()).hexdigest() == built, "NCCL is not the patched build"
@@ -277,10 +362,81 @@ for label, mod in (("direct_io", direct_native), ("engram_rows", engram_native))
 print("runtime build checks passed")
 PY
 
+# A CUDA 13.5 build's runtime-core (RUNTIME_CORE_STAGE=runtime-core-cuda-13-5): the
+# CuTe DSL wheel reinstall above rewrites files in nvidia/cu13 (it put a 13.2
+# libnvrtc.so.13 back), so wire it to CUDA 13.5 again, then check the toolchain and
+# the libraries torch, cuda.pathfinder and ctypes resolve.
+FROM runtime-core AS runtime-core-cuda-13-5
+
+LABEL local.spark-ds41f.cuda.version="13.5.37"
+
+RUN /usr/local/sbin/spark-wire-cuda-13-5
+RUN python3 - <<'PY'
+import ctypes
+import subprocess
+from pathlib import Path
+
+from cuda.pathfinder import find_nvidia_binary_utility
+
+for tool in ("nvcc", "ptxas"):
+    out = subprocess.check_output([f"/usr/local/cuda/bin/{tool}", "--version"], text=True)
+    assert "release 13.5, V13.5.37" in out, out
+    resolved = Path(find_nvidia_binary_utility(tool)).resolve()
+    assert resolved == Path(f"/usr/local/cuda-13.5/bin/{tool}"), resolved
+for lib_path in (
+    "/usr/local/cuda/lib64/libcublasLt.so.13",
+    "/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcublasLt.so.13",
+):
+    assert Path(lib_path).resolve() == Path(
+        "/usr/local/cuda-13.5/targets/sbsa-linux/lib/libcublasLt.so.13.10.0.20"
+    ), Path(lib_path).resolve()
+    assert ctypes.CDLL(lib_path).cublasLtGetVersion() == 131000
+for name in ("libcudart.so.13", "libnvrtc.so.13", "libnvJitLink.so.13", "libcublas.so.13"):
+    resolved = Path(f"/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/{name}").resolve()
+    assert resolved.is_relative_to("/usr/local/cuda-13.5/targets/sbsa-linux/lib"), resolved
+cudart = ctypes.CDLL("/usr/local/cuda/lib64/libcudart.so.13")
+rt_ver = ctypes.c_int()
+assert cudart.cudaRuntimeGetVersion(ctypes.byref(rt_ver)) == 0
+assert rt_ver.value == 13050, rt_ver.value
+print("CUDA 13.5 build checks passed")
+PY
+
+# A build with the lock's torch (RUNTIME_CORE_STAGE=runtime-core-cuda-13-5-torch-2-16):
+# the installed torch is the lock's, compiled for this toolkit and for the NCCL release
+# the patched library is, and it loads that library (libtorch_cuda.so binds NCCL's
+# symbols when it loads, so the import fails on a release that lacks one).
+FROM runtime-core-cuda-13-5 AS runtime-core-cuda-13-5-torch-2-16
+
+ARG NCCL_VERSION_CODE=23007
+LABEL local.spark-ds41f.torch.version="2.16.0.dev20261113+cu135"
+
+RUN python3 - <<'PY'
+import ctypes
+import os
+
+import torch
+import torchaudio  # noqa: F401
+import torchvision
+
+assert torch.__version__ == "2.16.0.dev20261113+cu135", torch.__version__
+assert torch.version.cuda == "13.5", torch.version.cuda
+compiled = torch.cuda.nccl.version()
+code = int(os.environ["NCCL_VERSION_CODE"])
+assert tuple(compiled[:3]) == (code // 10000, code // 100 % 100, code % 100), (compiled, code)
+nccl = "/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2"
+loaded = [line.split()[-1] for line in open("/proc/self/maps") if "libnccl.so" in line]
+assert loaded and set(loaded) == {nccl}, loaded
+version = ctypes.c_int()
+assert ctypes.CDLL(nccl).ncclGetVersion(ctypes.byref(version)) == 0 and version.value == code, version.value
+boxes = torch.tensor([[0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]])
+assert torchvision.ops.nms(boxes, torch.tensor([1.0, 0.5]), 0.5).tolist() == [0]
+print("torch build checks passed")
+PY
+
 # B12X, while the lock lists it (spark-ds41f-1025 and earlier): its tree on
 # PYTHONPATH, installed without dependencies (patches/b12x moves its exact CuTe
 # DSL pin to the locked wheel set's version).
-FROM runtime-core AS runtime
+FROM ${RUNTIME_CORE_STAGE} AS runtime
 
 ARG B12X_UPSTREAM=unrecorded
 ARG B12X_REF=unrecorded

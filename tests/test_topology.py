@@ -2,20 +2,18 @@
 
 import argparse
 import copy
-import importlib.machinery
-import importlib.util
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader("spark_topology_test", str(ROOT / "bin/spark"))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-spark = importlib.util.module_from_spec(spec)
-loader.exec_module(spark)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import spark_ds41f as spark
 topology = spark.topology
 
 
@@ -316,6 +314,36 @@ class TopologyTest(unittest.TestCase):
         self.assertNotEqual(spark.normalized_repository_url("https://github.com/example/spark-ds41f"),
                             spark.normalized_repository_url(current))
 
+    def test_control_ip_overrides_vllm_host_ip_and_master_addr(self):
+        nodes = copy.deepcopy(self.four)
+        for idx, node in enumerate(nodes["nodes"], 1):
+            node["control_ip"] = f"192.168.100.{idx}"
+        cand = topology.candidate(self.base, nodes, "config/nodes-ring.json")
+        self.assertEqual(cand["distributed"]["master_addr"], "192.168.100.1")
+        self.assertEqual(topology.problems(cand, nodes), [])
+        env = topology.node_environment(cand, nodes["nodes"][1])
+        self.assertEqual(env["VLLM_HOST_IP"], "192.168.100.2")
+
+
+    def test_two_node_switched_and_direct_topologies_are_valid(self):
+        switched = spark.read_cluster("config/cluster.json", "tp3-switched")
+        two_switched = spark.read_json("config/examples/nodes-switched.json")
+        two_switched["nodes"] = [copy.deepcopy(n) for n in two_switched["nodes"][:2]]
+        switched["distributed"]["master_addr"] = two_switched["nodes"][0]["management_ip"]
+        two_switched_cand = topology.candidate(switched, two_switched, "config/nodes.json")
+        self.assertEqual(topology.problems(two_switched_cand, two_switched), [])
+
+        two_direct = copy.deepcopy(self.four)
+        two_direct["nodes"] = [copy.deepcopy(n) for n in two_direct["nodes"][:2]]
+        for n in two_direct["nodes"]:
+            other = "1" if n["rank"] == 0 else "0"
+            kept_hcas = list(n["roce_peer_hcas"][other])
+            n["roce_peer_hcas"] = {other: kept_hcas}
+            n["roce_subnets"] = {h: n["roce_subnets"][h] for h in kept_hcas}
+        direct_base = copy.deepcopy(self.base)
+        direct_base["distributed"]["master_addr"] = two_direct["nodes"][0]["management_ip"]
+        two_direct_cand = topology.candidate(direct_base, two_direct, "config/nodes.json")
+        self.assertEqual(topology.problems(two_direct_cand, two_direct), [])
 
 if __name__ == "__main__":
     unittest.main()

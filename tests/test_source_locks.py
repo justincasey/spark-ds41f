@@ -3,17 +3,15 @@ the same revisions, patch counts, patch heads, trees and patch ranges."""
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import json
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader("spark_source_locks_test", str(ROOT / "bin" / "spark"))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-spark = importlib.util.module_from_spec(spec)
-loader.exec_module(spark)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import spark_ds41f as spark
 
 HISTORICAL_PROFILES = {
     "experiments/2026-10-03-tilelang-tp4-performance/round2-tilelang.json",
@@ -55,6 +53,19 @@ class SourceLockTest(unittest.TestCase):
                     continue
                 problems.append(f"{rel}: {problem}")
         self.assertGreater(checked, 0)
+        self.assertEqual(problems, [])
+
+    def test_a_listed_cuda_toolkit_is_one_the_build_can_install(self) -> None:
+        # sources.cuda_toolkit is optional; where a lock lists it, its version needs a
+        # Dockerfile stage and its lockfile must parse (tests/test_build.py, CudaToolkitTest).
+        lock_paths = [ROOT / "upstreams.lock.json", *sorted((ROOT / "releases").glob("*/upstreams.lock.json")),
+                      *sorted((ROOT / "experiments").rglob("upstreams.lock.json"))]
+        problems = []
+        for lock_path in lock_paths:
+            sources = json.loads(lock_path.read_text(encoding="utf-8")).get("sources", {})
+            rel = lock_path.relative_to(ROOT).as_posix()
+            problems += [f"{rel}: {problem}" for problem in spark.cuda_toolkit_problems(sources)]
+        self.assertGreater(len(lock_paths), 3)
         self.assertEqual(problems, [])
 
     def test_arm_notes_and_expected_labels_match_locks_and_manifests(self) -> None:

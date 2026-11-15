@@ -35,7 +35,7 @@ VLLM_RING_ENV = {
     "VLLM_DISABLE_PYNCCL": "0",
 }
 # Node-map fields for this repository's access to a node, not the fabric.
-SITE_FIELDS = ("transfer_host",)
+SITE_FIELDS = ("transfer_host", "control_ip")
 GID_PINS = ("NCCL_IB_GID_INDEX", "SPARKNET_ROCE_GID_INDEX")
 
 
@@ -133,10 +133,15 @@ def node_environment(cluster: dict, node: dict) -> dict[str, str]:
                 env["SPARKNET_ROCE_SUBNETS"] = json.dumps(subnets, separators=(",", ":"))
     else:
         env = base
-    env["VLLM_HOST_IP"] = node["management_ip"]
+    env["VLLM_HOST_IP"] = control_ip(node)
     if switched(mode):
         env["SPARK_DEPLOYMENT_TRANSPORT"] = str(mode)
     return env
+
+
+def control_ip(node: dict) -> str:
+    """The node's control-plane IP (defaults to management_ip)."""
+    return node.get("control_ip") or node["management_ip"]
 
 
 def hcas(cluster: dict, node: dict) -> list[str]:
@@ -166,10 +171,10 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
     count = len(entries)
     mode = transport(cluster)
     if switched(mode):
-        if not 3 <= count <= 8:
-            errors.append(f"switched deployment requires 3 to 8 nodes, got {count}")
-    elif count not in (3, 4):
-        errors.append(f"deployment requires 3 or 4 nodes, got {count}")
+        if not 2 <= count <= 8:
+            errors.append(f"switched deployment requires 2 to 8 nodes, got {count}")
+    elif count not in (2, 3, 4):
+        errors.append(f"deployment requires 2, 3 or 4 nodes, got {count}")
     settings = cluster.get("environment", {})
     if mode is None:
         errors.append("fabric.transport is required; a configuration without one ran B12X's "
@@ -184,8 +189,10 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
         if hasattr(sparknet.render, "base_problems"):
             errors.extend(sparknet.render.base_problems(check_settings))
     heads = [n for n in entries if n.get("head")]
-    if len(heads) == 1 and cluster.get("distributed", {}).get("master_addr") != heads[0].get("management_ip"):
-        errors.append("distributed.master_addr must match the API head's management_ip")
+    if len(heads) == 1:
+        allowed_master = {heads[0].get("management_ip"), heads[0].get("control_ip")} - {None}
+        if cluster.get("distributed", {}).get("master_addr") not in allowed_master:
+            errors.append("distributed.master_addr must match the API head's management_ip")
     if switched(mode):
         if cluster.get("fabric", {}).get("topology") != "switched":
             errors.append(f"{mode} requires explicit fabric.topology=switched")
@@ -301,7 +308,7 @@ def candidate(base: dict, nodes: dict, nodes_path: str) -> dict:
     ssh_user = nodes.get("ssh_user")
     if result.get("host", {}).get("home") == "/home/swank" and ssh_user not in (None, "", "swank", "u"):
         result["host"]["home"] = f"/home/{ssh_user}"
-    result["distributed"]["master_addr"] = next(n["management_ip"] for n in nodes["nodes"] if n.get("head"))
+    result["distributed"]["master_addr"] = next(control_ip(n) for n in nodes["nodes"] if n.get("head"))
     for flag in ("--tensor-parallel-size", "--nnodes"):
         set_argument(result, flag, str(count))
     spec = json.loads(argument(result, "--speculative-config") or "{}")
@@ -314,8 +321,17 @@ def candidate(base: dict, nodes: dict, nodes_path: str) -> dict:
         result.pop("benchmark_reference", None)
         for key in ("NCCL_SWITCHLESS_BIDIRECTIONAL", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
                     "NCCL_THREAD_THRESHOLDS", "NCCL_ALGO", "NCCL_MIN_NCHANNELS",
-                    "NCCL_ALGO_PLUGIN", "NCCL_TUNER_PLUGIN", "NCCL_GRAPH_FILE", "NCCL_TOPO_FILE"):
+                    "NCCL_ALGO_PLUGIN", "NCCL_TUNER_PLUGIN", "NCCL_GRAPH_FILE", "NCCL_TOPO_FILE",
+                    "NCCL_COLLNET_ENABLE", "NCCL_CUMEM_HOST_ENABLE", "NCCL_GIN_ENABLE",
+                    "NCCL_IB_SUBNET_PREFIX_LEN", "NCCL_MNNVL_ENABLE", "NCCL_PAT_ENABLE",
+                    "NCCL_RMA_DISABLE", "NCCL_RUNTIME_CONNECT"):
             result["environment"].pop(key, None)
+        result["environment"].update({
+            "NCCL_BUFFSIZE": "1048576",
+            "NCCL_CUMEM_ENABLE": "0",
+            "NCCL_MAX_NCHANNELS": "8",
+            "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "4194304",
+        })
         if "--disable-custom-all-reduce" in result["serve_args"]:
             result["serve_args"].remove("--disable-custom-all-reduce")
     elif count == 4 and not switched(transport(result)):

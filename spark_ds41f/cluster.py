@@ -1,0 +1,1569 @@
+"""Cluster lifecycle, SSH execution, container start/stop and memguard for spark-ds41f."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import concurrent.futures
+import fcntl
+import functools
+import hashlib
+import json
+import os
+import random
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import sysconfig
+import tempfile
+import threading
+import time
+import urllib.request
+import uuid
+from pathlib import Path, PurePosixPath
+from typing import NamedTuple
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CLUSTER_CONFIG = "config/cluster.json"
+sys.path.insert(0, str(ROOT / "scripts"))
+import source_labels
+import kernel_backend
+import kernel_readiness
+import topology
+import recipe as cluster_recipe
+
+from .config import *  # noqa: F401,F403
+from .doctor import *  # noqa: F401,F403
+
+def deployment_order(nodes: dict) -> list[dict]:
+    workers = sorted(
+        (node for node in nodes["nodes"] if not node["head"]),
+        key=lambda node: node["rank"],
+    )
+    heads = [node for node in nodes["nodes"] if node["head"]]
+    return workers + heads
+
+
+class Drift(str):
+    """A start problem that `cluster sync --apply` repairs: a node's checkout, profile or
+    image is not the one this checkout deploys."""
+
+
+def sync_command(cluster_config: str) -> str:
+    return f"bin/spark --cluster-config {cluster_config} cluster sync --apply"
+
+
+def local_deployment_problems(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
+    """This checkout's findings for a deployment: its doctor's, and any uncommitted file."""
+    findings = list(local_doctor(cluster, nodes, upstreams))
+    if repository_dirty():
+        findings.append("deployment requires a clean local repository")
+    return findings
+
+
+def require_local_deployment_state(cluster: dict, nodes: dict, upstreams: dict) -> str:
+    problems, warnings = split_findings(local_deployment_problems(cluster, nodes, upstreams))
+    for warning in warnings:
+        print(f"WARN: {warning}", file=sys.stderr)
+    if problems:
+        for problem in problems:
+            print(f"ERROR: {problem}", file=sys.stderr)
+        raise SystemExit(1)
+    return repository_revision()
+
+
+def profile_committed(revision: str, cluster_config: str) -> bool:
+    result = subprocess.run(["git", "cat-file", "-e", f"{revision}:{cluster_config}"], cwd=ROOT,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    return result.returncode == 0
+
+
+def missing_profile(node: dict, cluster_config: str) -> str:
+    """A node lacks a profile the deployed commit does not carry: an ignored *.local.json
+    profile stays on its host."""
+    return (f"{node['name']}: has no {cluster_config}, and the deployed commit does not carry it; a node "
+            "receives only committed files and the site map, so commit the profile, publish it and sync")
+
+
+def inspected_image(output: str, context: str) -> tuple[dict, dict]:
+    """Decode exactly one inspected image and validate its store-independent content."""
+    try:
+        images = json.loads(output)
+        if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+            raise ValueError("inspection must contain exactly one image")
+        image = images[0]
+        identity = image_content_identity(image)
+    except (ValueError, TypeError) as error:
+        raise SystemExit(f"{context}: invalid image inspection: {error}") from error
+    return image, identity
+
+
+def image_identity(nodes: dict, node: dict, tag: str) -> dict | None:
+    """The selected tag's content, or None only when Docker reports it missing.
+
+    Ordered layers and runtime Config survive faithful copies between Docker stores;
+    Docker image IDs may differ. An inspection error is not a missing image to repair.
+    """
+    result = run_ssh(nodes, node, "docker", "image", "inspect", tag)
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        if result.returncode == 1 and "no such image" in detail.lower():
+            return None
+        raise SystemExit(f"{node['name']}: cannot inspect {tag}: {detail}")
+    _, identity = inspected_image(result.stdout, f"{node['name']}: {tag}")
+    return identity
+
+
+def local_image(cluster: dict, tag: str, cluster_config: str) -> tuple[dict | None, str | None]:
+    """This host's content of the tag, and why it must not be copied to the nodes (None
+    when they may): the host lacks the tag, or holds another build than the profile expects."""
+    result = subprocess.run(["docker", "image", "inspect", tag], text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode:
+        detail = result.stderr.strip()
+        if result.returncode == 1 and "no such image" in detail.lower():
+            return None, (f"{tag} is not built on this host: "
+                        f"bin/spark --cluster-config {cluster_config} build image --apply")
+        raise SystemExit(f"cannot inspect {tag} on this host: {detail}")
+    image, identity = inspected_image(result.stdout, f"this host's {tag}")
+    if tag == cluster["container"]["image"]:
+        labels = image["Config"].get("Labels") or {}
+        for key, wanted in cluster["container"].get("expected_labels", {}).items():
+            if labels.get(key) != wanted:
+                return None, (f"this host's {tag} is another build (label {key}={labels.get(key)!r}, "
+                            f"the profile expects {wanted!r}): provide the profile's exact qualified "
+                            "image; do not replace an immutable tag")
+    return identity, None
+
+
+def image_copies(cluster: dict, nodes: dict, cluster_config: str,
+                 tag: str | None = None) -> tuple[dict | None, str | None, list[dict]]:
+    """The selected image on this host: its content, why it must not be copied (or None),
+    and the nodes whose copy differs, inspected concurrently."""
+    tag = tag or cluster["container"]["image"]
+    identity, problem = local_image(cluster, tag, cluster_config)
+    if problem:
+        return identity, problem, []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+        found = list(pool.map(lambda node: image_identity(nodes, node, tag), nodes["nodes"]))
+    return identity, None, [node for node, held in zip(nodes["nodes"], found) if held != identity]
+
+
+def load_image(nodes: dict, node: dict, tag: str, identity: dict) -> str | None:
+    """Copy this host's tag to a node over its transfer link and check its full content;
+    None on success, else the failure."""
+    target = transfer_target(nodes, node)
+    pipeline = (
+        f"docker save {shlex.quote(tag)} | "
+        f"ssh {shlex.join(ssh_options())} {shlex.quote(target)} docker load"
+    )
+    result = subprocess.run(
+        ["bash", "-o", "pipefail", "-c", pipeline],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        return f"{node['name']}: failed to load {tag}: {detail}"
+    if image_identity(nodes, node, tag) != identity:
+        return f"{node['name']}: image content for {tag} does not match after load"
+    return None
+
+
+# The repository was renamed from spark3-vllm-ds41f on 2026-10-05. Configurations
+# recorded before then name the former URL, which now holds a pointer repository.
+FORMER_REPOSITORY_URLS = {
+    "https://github.com/christopherowen/spark3-vllm-ds41f": "https://github.com/christopherowen/spark-ds41f",
+}
+
+
+def normalized_repository_url(url: str) -> str:
+    url = url.rstrip("/").removesuffix(".git")
+    return FORMER_REPOSITORY_URLS.get(url, url)
+
+
+def remote_status_command(cluster: dict) -> str:
+    repo = Path(repository_path(cluster))
+    pathspecs = ["."]
+    for source, _, mode in cluster["container"]["mounts"]:
+        if mode != "rw":
+            continue
+        source_path = Path(host_path(cluster, source))
+        try:
+            relative = source_path.relative_to(repo)
+        except ValueError:
+            continue
+        pathspecs.append(f":(exclude){relative.as_posix()}")
+    return shlex.join(
+        ["git", "status", "--porcelain", "--untracked-files=all", "--", *pathspecs]
+    )
+
+
+def remote_repository_state(
+    cluster: dict, nodes: dict, node: dict
+) -> tuple[str, str, str]:
+    path = shlex.quote(repository_path(cluster))
+    result = remote_shell(
+        nodes,
+        node,
+        f"cd {path} && printf '%s\\n' \"$(git rev-parse HEAD)\" && "
+        "git remote get-url origin && "
+        f"{remote_status_command(cluster)}",
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"{node['name']}: cannot inspect checkout: {detail}")
+    lines = result.stdout.splitlines()
+    if len(lines) < 2:
+        raise RuntimeError(f"{node['name']}: checkout returned incomplete identity")
+    return lines[0], lines[1], "\n".join(lines[2:]).strip()
+
+
+def unrecorded_subnet_problems(nodes: dict, node: dict, hcas: list[str]) -> list[str]:
+    """A multi-node start checks every RoCE interface against its cable's subnet; an
+    interface without a recorded subnet would skip that check, so it blocks the start."""
+    if len(nodes["nodes"]) < 2:
+        return []
+    missing = [hca for hca in hcas if hca not in node.get("roce_subnets", {})]
+    if not missing:
+        return []
+    return [f"{node['name']}: the node map records no cable subnet for {', '.join(missing)}, so a start "
+            "cannot check that the cabling is the one this profile was written for; add roce_subnets "
+            "(docs/switchless-topology.md)"]
+
+
+def remote_runtime_problems(
+    cluster: dict,
+    nodes: dict,
+    revision: str,
+    *,
+    allow_existing: bool,
+    cluster_config: str,
+) -> list[str]:
+    """Pre-launch checks of every node, the nodes concurrently; findings keep node order."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+        findings = pool.map(
+            lambda node: node_runtime_problems(
+                cluster, nodes, node, revision,
+                allow_existing=allow_existing, cluster_config=cluster_config,
+            ),
+            nodes["nodes"],
+        )
+        return [problem for node_problems in findings for problem in node_problems]
+
+
+def mount_test_script(cluster: dict) -> str:
+    """One remote script testing every mount source (writable for rw, readable for ro)."""
+    lines = []
+    for source, _, mode in cluster["container"]["mounts"]:
+        source = host_path(cluster, source)
+        test = "-w" if mode == "rw" else "-r"
+        lines.append(
+            f"test {test} {shlex.quote(source)} || printf '%s %s\\n' {mode} {shlex.quote(source)}"
+        )
+    return "\n".join(lines) + "\ntrue\n"
+
+
+def node_runtime_problems(
+    cluster: dict,
+    nodes: dict,
+    node: dict,
+    revision: str,
+    *,
+    allow_existing: bool,
+    cluster_config: str,
+) -> list[str]:
+    problems: list[str] = []
+    repo = repository_path(cluster)
+    name = cluster["container"]["name"]
+    try:
+        remote_revision, remote_origin, dirty = remote_repository_state(cluster, nodes, node)
+    except RuntimeError as error:
+        return [str(error)]
+    if remote_revision != revision:
+        problems.append(Drift(
+            f"{node['name']}: checkout {remote_revision} differs from deployment {revision}"
+        ))
+    if normalized_repository_url(remote_origin) != normalized_repository_url(
+        cluster["deployment"]["repository"]
+    ):
+        problems.append(
+            f"{node['name']}: origin {remote_origin!r} differs from deployment repository"
+        )
+    if dirty:
+        problems.append(f"{node['name']}: checkout has uncommitted files")
+    if cluster["host"].get("kernel"):
+        policy = json.loads(kernel_policy_path(cluster).read_text())
+        inventory = node_kernel_inventory(nodes, node, policy)
+        problems.extend(
+            Warn(problem)
+            for problem in kernel_readiness.profile_problems(
+                node["name"], inventory, cluster["host"]["kernel"], policy
+            )
+        )
+    _, hcas = roce_gid_setting(cluster, node)
+    gids = remote_shell(nodes, node, roce_gid_query(hcas))
+    problems.extend(roce_gid_findings(cluster, node, gids.stdout, hcas=hcas))
+    problems.extend(unrecorded_subnet_problems(nodes, node, hcas))
+    if run_ssh(nodes, node, "test", "-f", f"{repo}/{cluster_config}").returncode:
+        # The node's doctor would only fail on the missing file.
+        problems.append(
+            Drift(f"{node['name']}: has no {cluster_config}")
+            if profile_committed(revision, cluster_config)
+            else missing_profile(node, cluster_config)
+        )
+    else:
+        doctor = run_ssh(
+            nodes,
+            node,
+            f"{repo}/bin/spark",
+            "--cluster-config",
+            cluster_config,
+            "doctor",
+        )
+        if doctor.returncode:
+            detail = doctor.stdout.strip() or doctor.stderr.strip()
+            problems.append(f"{node['name']}: repository doctor failed: {detail}")
+    mounts = run_ssh(nodes, node, "sh", "-c", mount_test_script(cluster))
+    for line in mounts.stdout.splitlines():
+        mode, _, source = line.partition(" ")
+        problems.append(f"{node['name']}: {mode} mount source is unavailable: {source}")
+    problems.extend(node_glp_problems(cluster, nodes, node))
+    image = run_ssh(
+        nodes,
+        node,
+        "docker",
+        "image",
+        "inspect",
+        cluster["container"]["image"],
+    )
+    # Sync copies the image from the head (where start and sync run) to the other nodes;
+    # a head without the right build needs a build instead.
+    if image.returncode:
+        if "permission denied" in image.stderr.lower() and "docker.sock" in image.stderr:
+            problems.append(
+                f"{node['name']}: cannot inspect Docker image {cluster['container']['image']}: "
+                f"{docker_error_detail(node['name'], image.stderr)}"
+            )
+        elif node["head"]:
+            problems.append(
+                f"{node['name']}: image is unavailable: {cluster['container']['image']}; build it: "
+                f"bin/spark --cluster-config {cluster_config} build image --apply"
+            )
+        else:
+            problems.append(Drift(
+                f"{node['name']}: image is unavailable: {cluster['container']['image']}"
+            ))
+    else:
+        labels = json.loads(image.stdout)[0]["Config"].get("Labels") or {}
+        for key, wanted in cluster["container"]["expected_labels"].items():
+            if labels.get(key) != wanted:
+                finding = f"{node['name']}: image label {key}={labels.get(key)!r}, expected {wanted!r}"
+                problems.append(finding if node["head"] else Drift(finding))
+    existing = run_ssh(nodes, node, "docker", "inspect", name)
+    if existing.returncode == 0 and not allow_existing:
+        problems.append(
+            f"{node['name']}: container {name} already exists; use --replace explicitly"
+        )
+    # --replace replaces only a container of this profile's name: an engine serving under
+    # another (an arm from before the rename to spark-ds41f, or after it) would keep the GPU.
+    others = run_ssh(nodes, node, "docker", "ps", *serving_filters(cluster),
+                     "--format", f'{{{{.Names}}}}\t{{{{.Label "{PROFILE_LABEL}"}}}}')
+    for line in others.stdout.splitlines():
+        other, _, profile = line.partition("\t")
+        if other and other != name:
+            problems.append(
+                f"{node['name']}: {other} is serving; stop it with its own profile before starting {name}: "
+                f"{stop_own_profile({'profile': profile or None})}"
+            )
+    sudo = run_ssh(nodes, node, "sudo", "-n", "true")
+    if sudo.returncode:
+        problems.append(f"{node['name']}: passwordless sudo is unavailable for memguard")
+    return problems
+
+
+def start_findings(
+    cluster: dict, nodes: dict, upstreams: dict, *, allow_existing: bool, cluster_config: str
+) -> list[str]:
+    """Every check a start makes before it touches a node: this checkout's, then each node's
+    against this checkout's commit. They only read, so the plan makes them too."""
+    return [
+        *local_deployment_problems(cluster, nodes, upstreams),
+        *remote_runtime_problems(cluster, nodes, repository_revision(),
+                                 allow_existing=allow_existing, cluster_config=cluster_config),
+    ]
+
+
+def report_start_findings(findings: list[str], cluster_config: str, file) -> bool:
+    """Print a start's warnings and problems, then the command that repairs node drift;
+    True when nothing blocks the start."""
+    problems, warnings = split_findings(findings)
+    for warning in warnings:
+        print(f"WARN: {warning}", file=file)
+    for problem in problems:
+        print(f"ERROR: {problem}", file=file)
+    if any(isinstance(problem, Drift) for problem in problems):
+        print(f"fix: {sync_command(cluster_config)} gives every node this commit and its image", file=file)
+    return not problems
+
+
+def image_plan(tag: str, problem: str | None, differ: list[dict]) -> str:
+    if problem:
+        return f"image: not copied: {problem}"
+    if not differ:
+        return f"image: every node has this host's {tag}"
+    return f"image: copy {tag} from this host to {', '.join(node['name'] for node in differ)}"
+
+
+def sync_image(args: argparse.Namespace, revision: str, cluster_config: str) -> int:
+    """Copy the image the deployed profile names to every node whose copy differs from this
+    host's. A host without a copy to give only warns: a build may follow the sync."""
+    if repository_revision() != revision:
+        print(f"WARN: this checkout is not at {revision}, so the image its profile names is not "
+              "copied; sync again from a checkout at that commit", file=sys.stderr)
+        return 0
+    # Read again: the checkout can be ROOT, and the deployed profile may name another image.
+    cluster, nodes, _ = configuration(args)
+    tag = cluster["container"]["image"]
+    identity, problem, differ = image_copies(cluster, nodes, cluster_config)
+    if problem:
+        print(f"WARN: image not copied: {problem}", file=sys.stderr)
+        return 0
+    for node in differ:
+        started = time.monotonic()
+        failure = load_image(nodes, node, tag, identity)
+        if failure:
+            print(f"ERROR: {failure}", file=sys.stderr)
+            return 1
+        print(f"{node['name']}: loaded {tag} in {time.monotonic() - started:.0f} s", flush=True)
+    print(f"every node holds {tag}")
+    return 0
+
+
+def command_cluster_sync(args: argparse.Namespace) -> int:
+    require_named_profile(args)
+    cluster, nodes, upstreams = configuration(args)
+    _, config_relative = cluster_config_path(args)
+    if args.revision:
+        # A named commit or ref may be newer than this checkout's last fetch (a hash just
+        # merged, or origin/main): fetch before resolving it.
+        checked(["git", "fetch", "--quiet", "--prune", "origin"], cwd=ROOT)
+    revision = repository_revision(args.revision or "HEAD")
+    path = repository_path(cluster)
+    for node in nodes["nodes"]:
+        print(f"{node['name']}: fetch origin and detach {path} at {revision}")
+    if not args.apply:
+        if revision == repository_revision():
+            _, problem, differ = image_copies(cluster, nodes, config_relative)
+            print(image_plan(cluster["container"]["image"], problem, differ))
+        else:
+            print(f"image: then copy the one {config_relative} names at {revision} from this host "
+                  "to every node whose copy differs")
+        print("plan only; pass --apply to synchronize")
+        return 0
+
+    local_revision = require_local_deployment_state(cluster, nodes, upstreams)
+    if revision != local_revision and args.revision is None:
+        raise SystemExit("resolved deployment revision changed unexpectedly")
+    # Only published commits deploy. A configured branch (the promoted config
+    # uses main) restricts deployment to that branch; without one, any commit
+    # reachable from a branch on origin qualifies, so experiment configs keep
+    # working after their branch is merged and deleted.
+    branch = cluster["deployment"].get("branch")
+    checked(["git", "fetch", "--quiet", "--prune", "origin"], cwd=ROOT)
+    containing = [
+        ref.removeprefix("origin/")
+        for ref in subprocess.run(
+            ["git", "branch", "--remotes", "--contains", revision,
+             "--format=%(refname:short)"],
+            cwd=ROOT,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.split()
+        if ref.startswith("origin/") and ref != "origin/HEAD"
+    ]
+    if branch is not None and branch not in containing:
+        raise SystemExit(
+            f"refusing to deploy {revision}: it is not published on origin/{branch}"
+        )
+    if not containing:
+        raise SystemExit(
+            f"refusing to deploy {revision}: it is not published on any origin branch"
+        )
+
+    previous: dict[str, str] = {}
+    committed = profile_committed(revision, config_relative)
+    for node in nodes["nodes"]:
+        try:
+            old_revision, remote_origin, dirty = remote_repository_state(
+                cluster, nodes, node
+            )
+        except RuntimeError as error:
+            raise SystemExit(str(error)) from error
+        # Each node's doctor runs this profile after the checkout.
+        if not committed and run_ssh(nodes, node, "test", "-f", f"{path}/{config_relative}").returncode:
+            raise SystemExit(missing_profile(node, config_relative))
+        if dirty:
+            raise SystemExit(
+                f"{node['name']}: checkout is dirty; preserve or remove its changes explicitly"
+            )
+        if normalized_repository_url(remote_origin) != normalized_repository_url(
+            cluster["deployment"]["repository"]
+        ):
+            raise SystemExit(
+                f"{node['name']}: origin {remote_origin!r} is not the configured repository"
+            )
+        previous[node["name"]] = old_revision
+
+    # Read before any checkout: on the head node the checkout can be ROOT, and
+    # moving it off a commit that still tracked the file removes it.
+    site_paths = {cluster.get("nodes_config", NODES_FILE)}
+    for optional in (NODES_FILE, cluster_recipe.SITE_FILE):
+        if (ROOT / optional).is_file():
+            site_paths.add(optional)
+    site_texts = {relative: repository_config_path(relative).read_text(encoding="utf-8") for relative in site_paths}
+    quoted_path = shlex.quote(path)
+    fetch_script = (
+        f"cd {quoted_path} && git fetch --quiet --prune origin && "
+        f"git cat-file -e {shlex.quote(revision)}^{{commit}}"
+    )
+    for node in nodes["nodes"]:
+        result = remote_shell(nodes, node, fetch_script)
+        if result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise SystemExit(f"{node['name']}: fetch failed: {detail}")
+
+    changed: list[dict] = []
+    try:
+        for node in nodes["nodes"]:
+            checkout = remote_shell(
+                nodes,
+                node,
+                f"cd {quoted_path} && git checkout --quiet --detach {shlex.quote(revision)}",
+            )
+            if checkout.returncode:
+                detail = checkout.stderr.strip() or checkout.stdout.strip()
+                raise RuntimeError(f"{node['name']}: checkout failed: {detail}")
+            changed.append(node)
+            for relative, site_text in site_texts.items():
+                copied = write_remote_file(nodes, node, f"{path}/{relative}", site_text)
+                if copied.returncode:
+                    detail = copied.stderr.strip() or copied.stdout.strip()
+                    raise RuntimeError(f"{node['name']}: cannot copy {relative}: {detail}")
+            doctor = run_ssh(
+                nodes,
+                node,
+                f"{path}/bin/spark",
+                "--cluster-config",
+                config_relative,
+                "doctor",
+            )
+            if doctor.returncode:
+                detail = doctor.stdout.strip() or doctor.stderr.strip()
+                raise RuntimeError(f"{node['name']}: doctor failed after checkout: {detail}")
+    except RuntimeError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        print("rolling changed checkouts back", file=sys.stderr)
+        for node in reversed(changed):
+            remote_shell(
+                nodes,
+                node,
+                f"cd {quoted_path} && git checkout --quiet --detach "
+                f"{shlex.quote(previous[node['name']])}",
+            )
+        return 1
+
+    print(f"all nodes now use deployment commit {revision}")
+    return sync_image(args, revision, config_relative)
+
+
+def stop_memguard(cluster: dict, nodes: dict, node: dict) -> subprocess.CompletedProcess[str]:
+    unit = f"{cluster['container']['name']}-memguard.service"
+    return run_ssh(nodes, node, "sudo", "-n", "systemctl", "stop", unit)
+
+
+def memguard_is_active(cluster: dict, nodes: dict, node: dict) -> bool:
+    unit = f"{cluster['container']['name']}-memguard.service"
+    result = run_ssh(nodes, node, "systemctl", "is-active", "--quiet", unit)
+    return result.returncode == 0
+
+
+MEMORY_SETTLE_INTERVAL_SECONDS = 5
+MEMORY_SETTLE_GIB = 0.5
+MEMORY_RECOVERY_TIMEOUT_SECONDS = 180
+
+
+def available_gib(nodes: dict, node: dict) -> float:
+    result = run_ssh(nodes, node, "awk", "/^MemAvailable:/{print $2}", "/proc/meminfo")
+    try:
+        return int(result.stdout.strip()) / 1048576
+    except ValueError:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise RuntimeError(f"{node['name']}: cannot read MemAvailable: {detail}") from None
+
+
+def wait_for_memory_recovery(
+    cluster: dict,
+    nodes: dict,
+    stopped: list[dict],
+    *,
+    sleep=time.sleep,
+    clock=time.monotonic,
+) -> None:
+    """Wait until each node's MemAvailable stops rising after its old engine stopped.
+
+    A stopped engine returns its memory over seconds, not at `docker stop`'s exit: a rank
+    launched before then meets a startup memguard armed against memory still being
+    returned, and the guard kills a healthy boot (2026-10-25, a TP3 triangle at 1M, twice).
+    """
+    line = cluster["host"]["startup_memguard_gib"]
+    previous: dict[str, float] = {}
+    pending = list(stopped)
+    deadline = clock() + MEMORY_RECOVERY_TIMEOUT_SECONDS
+    while pending:
+        waiting = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(pending)) as pool:
+            readings = list(pool.map(lambda node: available_gib(nodes, node), pending))
+        for node, now in zip(pending, readings):
+            before = previous.get(node["name"])
+            if before is None or now - before >= MEMORY_SETTLE_GIB:
+                previous[node["name"]] = now
+                waiting.append(node)
+                continue
+            if now <= line:
+                raise RuntimeError(
+                    f"{node['name']}: MemAvailable settled at {now:.2f} GiB after the old engine "
+                    f"stopped, at or below the {line} GiB startup memguard; a launch would be killed"
+                )
+            print(f"{node['name']}: MemAvailable {now:.1f} GiB after the old engine stopped", flush=True)
+        pending = waiting
+        if not pending:
+            return
+        if clock() >= deadline:
+            still = ", ".join(f"{node['name']} {previous[node['name']]:.1f} GiB" for node in pending)
+            raise RuntimeError(
+                f"MemAvailable still rising {MEMORY_RECOVERY_TIMEOUT_SECONDS}s after the old engine "
+                f"stopped ({still}); refusing to arm the startup memguard"
+            )
+        sleep(MEMORY_SETTLE_INTERVAL_SECONDS)
+
+
+def defragment_before_start(cluster: dict) -> bool:
+    """Whether cluster start defragments buddy memory before launch
+    (host.defragment_before_start, default true; a profile sets it false to skip)."""
+    return cluster.get("host", {}).get("defragment_before_start", True) is not False
+
+
+def defragment_buddy_memory(nodes: dict, target_nodes: list[dict]) -> None:
+    """Drop reclaimable VFS page/slab caches and compact buddy memory on stopped nodes.
+
+    On GB10 UMA, clean VFS page-cache and dentry pages scattered across 2 MiB
+    pageblocks consume ``MemFree`` and block ``kcompactd`` from coalescing
+    ``>= 2 MiB`` contiguous physical blocks before ``cuMemCreate`` weight loading.
+    Runs only after any existing serving container has stopped and before rank launch.
+    """
+    if not target_nodes:
+        return
+
+    def compact_one(node: dict) -> str | None:
+        res = run_ssh(
+            nodes,
+            node,
+            "sudo",
+            "-n",
+            "sh",
+            "-c",
+            "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory",
+        )
+        if res.returncode:
+            detail = (res.stderr or res.stdout).strip() or f"exit {res.returncode}"
+            return f"{node['name']}: buddy memory defragmentation skipped ({detail})"
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(target_nodes)) as pool:
+        warnings = [w for w in pool.map(compact_one, target_nodes) if w]
+    for warning in warnings:
+        print(f"WARN: {warning}", file=sys.stderr, flush=True)
+
+
+def wait_for_api(cluster: dict, nodes: dict) -> None:
+    head = next(node for node in nodes["nodes"] if node["head"])
+    name = cluster["container"]["name"]
+    url = cluster["deployment"]["ready_url"]
+    timeout = int(cluster["deployment"]["ready_timeout_seconds"])
+    deadline = time.monotonic() + timeout
+    unreachable_since: dict[str, float] = {}
+    print(f"waiting up to {timeout}s for {head['name']} API readiness", flush=True)
+    while time.monotonic() < deadline:
+        unavailable = False
+        for node in nodes["nodes"]:
+            state = run_ssh(
+                nodes,
+                node,
+                "docker",
+                "inspect",
+                "--format",
+                "{{.State.Running}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}",
+                name,
+            )
+            if state.returncode:
+                unavailable = True
+                if node["name"] not in unreachable_since:
+                    unreachable_since[node["name"]] = time.monotonic()
+                    detail = state.stderr.strip() or "SSH unavailable"
+                    print(
+                        f"WARN: {node['name']} temporarily unreachable during "
+                        f"startup ({detail}); waiting for an inspectable state",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                continue
+            if node["name"] in unreachable_since:
+                elapsed = int(time.monotonic() - unreachable_since.pop(node["name"]))
+                print(
+                    f"{node['name']}: control path recovered after {elapsed}s",
+                    flush=True,
+                )
+            if not state.stdout.startswith("true "):
+                state_detail = state.stdout.strip() or state.stderr.strip() or "absent"
+                logs = run_ssh(nodes, node, "docker", "logs", "--tail", "20", name)
+                log_detail = (logs.stdout or logs.stderr).strip()
+                if len(log_detail) > 4000:
+                    log_detail = log_detail[-4000:]
+                raise RuntimeError(
+                    f"{node['name']}: {name} stopped before readiness "
+                    f"({state_detail})\n{log_detail}"
+                )
+            if not memguard_is_active(cluster, nodes, node):
+                raise RuntimeError(
+                    f"{node['name']}: startup memguard is no longer active; "
+                    "refusing to continue an unguarded launch"
+                )
+        if unavailable:
+            time.sleep(10)
+            continue
+        result = run_ssh(
+            nodes,
+            head,
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "3",
+            url,
+        )
+        if result.returncode == 0:
+            print("API ready; JIT/autotuning startup has completed", flush=True)
+            return
+        time.sleep(1)
+    unreachable = ", ".join(sorted(unreachable_since))
+    suffix = f"; unreachable nodes: {unreachable}" if unreachable else ""
+    raise RuntimeError(f"API did not become ready within {timeout}s{suffix}")
+
+
+def memguard_settings(cluster: dict, phase: str, mode: str = "running") -> list[str]:
+    """The guard's container, phase, threshold (GiB), interval, container wait
+    (seconds), mode and warn line (GiB, 0 for none), from the resolved configuration:
+    an arm overlay or a recipe has no such fields of its own, so the guard never reads
+    the file. The warn line belongs to the steady guard: the startup guard runs at the
+    launch line, above it."""
+    host = cluster["host"]
+    if phase == "startup":
+        values = (host["startup_memguard_gib"], host["startup_memguard_interval_seconds"],
+                  host["startup_memguard_wait_seconds"])
+    elif phase == "steady":
+        values = (host["memguard_gib"], host["memguard_interval_seconds"], 0)
+    else:
+        raise ValueError(f"memguard phase must be startup or steady, not {phase!r}")
+    warn_gib = host.get("memguard_warn_gib", 0) if phase == "steady" else 0
+    return [cluster["container"]["name"], phase, *(str(value) for value in values), mode, str(warn_gib)]
+
+
+def start_memguard(
+    cluster: dict,
+    nodes: dict,
+    node: dict,
+    phase: str,
+    *,
+    prelaunch: bool = False,
+) -> None:
+    script = f"{repository_path(cluster)}/scripts/memguard-start.sh"
+    arguments = [script, *memguard_settings(cluster, phase, "prelaunch" if prelaunch else "running")]
+    result = run_ssh(nodes, node, *arguments)
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            f"{node['name']}: cannot arm {phase} memguard: {detail}"
+        )
+    print(f"{node['name']}: {result.stdout.strip()}", flush=True)
+
+
+def start_memguards(cluster: dict, nodes: dict, phase: str) -> None:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+        futures = [
+            pool.submit(start_memguard, cluster, nodes, node, phase)
+            for node in nodes["nodes"]
+        ]
+        for future in futures:
+            future.result()
+
+
+def preserve_failed_start_logs(
+    cluster: dict,
+    nodes: dict,
+    started: list[dict],
+    cluster_config: str,
+) -> Path | None:
+    """Copy complete container logs locally before rollback removes containers."""
+    if not started:
+        return None
+
+    config_path = ROOT / cluster_config
+    if config_path.parent.parent == ROOT / "experiments":
+        base = config_path.parent / "runs" / "failed-starts"
+    else:
+        base = ROOT / "results" / "private" / "failed-starts"
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    destination = base / f"{stamp}-{cluster['container']['name']}"
+    destination.mkdir(parents=True, exist_ok=False)
+
+    name = cluster["container"]["name"]
+    for node in started:
+        state = run_ssh(nodes, node, "docker", "inspect", name)
+        logs = remote_shell(
+            nodes,
+            node,
+            f"docker logs --timestamps {shlex.quote(name)} 2>&1",
+        )
+        content = (
+            f"node: {node['name']}\n"
+            f"container: {name}\n"
+            f"inspect_returncode: {state.returncode}\n"
+            "\n[docker inspect]\n"
+            f"{state.stdout}{state.stderr}"
+            "\n[docker logs]\n"
+            f"{logs.stdout}{logs.stderr}"
+        )
+        (destination / f"{node['name']}.log").write_text(content, encoding="utf-8")
+    return destination
+
+
+def restore_containers(
+    cluster: dict,
+    nodes: dict,
+    backups: dict[str, str],
+    started: list[dict],
+) -> None:
+    name = cluster["container"]["name"]
+    for node in nodes["nodes"]:
+        stop_memguard(cluster, nodes, node)
+    for node in started:
+        run_ssh(nodes, node, "docker", "rm", "--force", name)
+    for node in deployment_order(nodes):
+        backup = backups.get(node["name"])
+        if not backup:
+            continue
+        renamed = run_ssh(nodes, node, "docker", "rename", backup, name)
+        if renamed.returncode:
+            print(f"WARN: {node['name']}: could not restore container name", file=sys.stderr)
+            continue
+        try:
+            start_memguard(cluster, nodes, node, "startup", prelaunch=True)
+        except RuntimeError as error:
+            print(
+                f"WARN: {error}; did not start restored container unguarded",
+                file=sys.stderr,
+            )
+            continue
+        start_result = run_ssh(nodes, node, "docker", "start", name)
+        if start_result.returncode:
+            stop_memguard(cluster, nodes, node)
+            print(f"WARN: {node['name']}: could not restart previous container", file=sys.stderr)
+            continue
+
+
+# The label naming the profile a container was started from, so a later plan can show
+# the live engine's own profile and the command that stops it.
+PROFILE_LABEL = "spark.cluster-config"
+# What "the engine's shape" means: a start that changes any of these is a different
+# deployment, not a restart.
+SHAPE_FLAGS = (("nodes", "--nnodes"), ("tp", "--tensor-parallel-size"),
+               ("context", "--max-model-len"), ("kv", "--kv-cache-memory-bytes"))
+
+
+def require_named_profile(args: argparse.Namespace) -> None:
+    """Every --apply acts on a profile named on the command line, never on the default."""
+    if getattr(args, "apply", False) and getattr(args, "cluster_config", None) is None:
+        raise SystemExit(
+            "--apply changes the nodes, so name the profile: bin/spark --cluster-config PATH ... --apply "
+            f"({DEFAULT_CLUSTER_CONFIG} is the default only for read-only commands)"
+        )
+
+
+def engine_shape(command: list[str]) -> dict[str, str | None]:
+    """Node count, tensor parallelism, context and KV bytes of a vLLM command."""
+    def value(flag: str) -> str | None:
+        return command[command.index(flag) + 1] if flag in command[:-1] else None
+
+    shape = {key: value(flag) for key, flag in SHAPE_FLAGS}
+    shape["nodes"] = shape["nodes"] or "1"
+    shape["tp"] = shape["tp"] or "1"
+    return shape
+
+
+def engine_text(shape: dict[str, str | None]) -> str:
+    context, kv = shape.get("context"), shape.get("kv")
+    context_text = f"{int(context):,}" if context and context.isdigit() else context or "default"
+    kv_text = f"{int(kv) / 2**30:.1f} GiB" if kv and kv.isdigit() else kv or "default"
+    return f"{shape['nodes']} nodes, TP{shape['tp']}, context {context_text}, KV {kv_text}"
+
+
+def head_node(nodes: dict) -> dict:
+    return next(node for node in nodes["nodes"] if node["head"])
+
+
+def live_engine(cluster: dict, nodes: dict) -> dict | None:
+    """The engine container on the profile's head node, running or stopped; None if absent.
+
+    Raises RuntimeError when the head node cannot be reached."""
+    head = head_node(nodes)
+    result = run_ssh(nodes, head, "docker", "inspect", cluster["container"]["name"])
+    if result.returncode == 255:
+        raise RuntimeError(f"cannot reach {head['name']} to inspect the live engine: {result.stderr.strip()}")
+    if result.returncode and "permission denied" in result.stderr.lower() and "docker.sock" in result.stderr:
+        raise RuntimeError(
+            f"cannot inspect Docker on {head['name']}: {docker_error_detail(head['name'], result.stderr)}"
+        )
+    if result.returncode:
+        return None
+    inspection = json.loads(result.stdout)[0]
+    return {
+        "shape": engine_shape(inspection["Config"]["Cmd"] or []),
+        "image": inspection["Config"]["Image"],
+        "running": bool(inspection["State"]["Running"]),
+        "profile": (inspection["Config"].get("Labels") or {}).get(PROFILE_LABEL),
+    }
+
+
+def describe_live(live: dict | None) -> str:
+    if live is None:
+        return "no engine container on the head node"
+    state = "running" if live["running"] else "stopped"
+    return (f"{state}: {engine_text(live['shape'])}, image {live['image']}, "
+            f"started from {live['profile'] or 'an unrecorded profile'}")
+
+
+def shape_changes(live: dict | None, planned: dict[str, str | None]) -> list[str]:
+    if live is None:
+        return []
+    return [key for key, _ in SHAPE_FLAGS if live["shape"].get(key) != planned.get(key)]
+
+
+def stop_own_profile(live: dict) -> str:
+    return f"bin/spark --cluster-config {live['profile'] or 'PATH'} cluster stop --apply"
+
+
+def start_refusal(live: dict | None, planned: dict[str, str | None], change_shape: bool) -> str | None:
+    """Why --apply must not start this profile over the live engine, or None."""
+    if live is None:
+        return None
+    if live["running"] and live["shape"]["nodes"] != planned["nodes"]:
+        return (f"a {live['shape']['nodes']}-node engine is running and this profile has {planned['nodes']} "
+                "nodes; replacing it here would leave its other nodes on a broken engine. Stop it with its "
+                f"own profile first: {stop_own_profile(live)}")
+    changes = shape_changes(live, planned)
+    if changes and not change_shape:
+        return (f"this start changes the engine's {', '.join(changes)} ({engine_text(live['shape'])} -> "
+                f"{engine_text(planned)}); pass --change-shape if that is intended")
+    return None
+
+
+def launch_command(cluster: dict, node: dict, config_relative: str) -> list[str]:
+    """The rank's docker run, labelled with the profile it was started from."""
+    command = rendered_docker_command(cluster, node)
+    return [*command[:5], "--label", f"{PROFILE_LABEL}={config_relative}", *command[5:]]
+
+
+def command_cluster_start(args: argparse.Namespace) -> int:
+    require_named_profile(args)
+    cluster, nodes, upstreams = configuration(args)
+    _, config_relative = cluster_config_path(args)
+    if args.apply and "shape" in cluster and "benchmark_reference" not in cluster and not args.unqualified_shape:
+        raise SystemExit(
+            f"no release benchmark qualifies this recipe's image on {cluster['shape']}: bench it in a lab "
+            "window first (experiments/2026-10-14-one-recipe/README.md), or pass --unqualified-shape"
+        )
+    if args.apply and not cluster["deployment"]["launch_enabled"]:
+        print(
+            "ERROR: this cluster configuration is not authorized for launch",
+            file=sys.stderr,
+        )
+        return 1
+    name = cluster["container"]["name"]
+    order = deployment_order(nodes)
+    planned = engine_shape(expected_command(cluster, head_node(nodes)))
+    try:
+        live, unreachable = live_engine(cluster, nodes), None
+    except RuntimeError as error:
+        live, unreachable = None, str(error)
+    changes = shape_changes(live, planned)
+    print(f"profile: {config_relative} on {', '.join(node['name'] for node in nodes['nodes'])}")
+    print(f"live:    {unreachable or describe_live(live)}")
+    print(f"plan:    {engine_text(planned)}, image {cluster['container']['image']}")
+    print("shape:   " + (f"CHANGES {', '.join(changes)}" if changes else "new engine" if live is None else "unchanged"))
+    print("start plan (fail-closed startup memory guards):")
+    if defragment_before_start(cluster):
+        print("  every node: drop clean caches and compact memory (host.defragment_before_start)")
+    else:
+        print("  no defragmentation before launch (host.defragment_before_start is false)")
+    for node in order:
+        print(f"  {node['name']}: pre-arm startup memguard, launch rank {node['rank']}")
+        if getattr(args, "verbose", False):
+            print(f"    {shlex.join(launch_command(cluster, node, config_relative))}")
+    print("  wait for API/JIT readiness, then switch every node to steady memguard")
+    refusal = unreachable or start_refusal(live, planned, getattr(args, "change_shape", False))
+    if not args.apply:
+        if refusal:
+            print(f"--apply would refuse: {refusal}")
+        if unreachable is None:
+            findings = start_findings(cluster, nodes, upstreams, allow_existing=args.replace,
+                                      cluster_config=config_relative)
+            print("preflight: " + ("--apply would refuse:" if split_findings(findings)[0] else "clean"))
+            report_start_findings(findings, config_relative, sys.stdout)
+        print("plan only; pass --apply to start the cluster (--verbose prints each docker command)")
+        return 0
+    if refusal:
+        print(f"ERROR: {refusal}", file=sys.stderr)
+        return 1
+
+    findings = start_findings(cluster, nodes, upstreams, allow_existing=args.replace,
+                              cluster_config=config_relative)
+    if not report_start_findings(findings, config_relative, sys.stderr):
+        return 1
+
+    backup_suffix = f"pre-{int(time.time())}"
+    backups: dict[str, str] = {}
+    started: list[dict] = []
+    launch_began = time.monotonic()
+
+    def elapsed() -> str:
+        return f"+{time.monotonic() - launch_began:.1f}s"
+
+    try:
+        def stop_stale_memguard(node: dict) -> str | None:
+            stop_memguard(cluster, nodes, node)
+            if memguard_is_active(cluster, nodes, node):
+                return f"{node['name']}: stale memguard is still active; refusing startup"
+            return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+            stale_errors = [
+                err for err in pool.map(stop_stale_memguard, nodes["nodes"]) if err
+            ]
+        if stale_errors:
+            raise RuntimeError("; ".join(stale_errors))
+        if args.replace:
+            def replace(node: dict) -> tuple[str | None, str | None]:
+                """Stop and keep one node's old container; return (backup, error)."""
+                exists = run_ssh(nodes, node, "docker", "inspect", name)
+                if exists.returncode:
+                    return None, None
+                backup = f"{name}-{backup_suffix}"
+                stopped = run_ssh(nodes, node, "docker", "stop", "--time", "60", name)
+                if stopped.returncode:
+                    return None, f"{node['name']}: could not stop {name}"
+                renamed = run_ssh(nodes, node, "docker", "rename", name, backup)
+                if renamed.returncode:
+                    run_ssh(nodes, node, "docker", "start", name)
+                    return None, f"{node['name']}: could not preserve {name}"
+                return backup, None
+
+            # The nodes stop their old containers concurrently (a vLLM shutdown takes
+            # several seconds per node); any failure rolls back every stopped node.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+                outcomes = list(pool.map(replace, nodes["nodes"]))
+            errors = []
+            for node, (backup, error) in zip(nodes["nodes"], outcomes):
+                if backup:
+                    backups[node["name"]] = backup
+                if error:
+                    errors.append(error)
+            if errors:
+                raise RuntimeError("; ".join(errors))
+            wait_for_memory_recovery(
+                cluster, nodes, [node for node in nodes["nodes"] if node["name"] in backups]
+            )
+        if defragment_before_start(cluster):
+            defragment_buddy_memory(nodes, order)
+        def launch_node(node: dict) -> tuple[dict | None, str | None, str | None]:
+            start_memguard(cluster, nodes, node, "startup", prelaunch=True)
+            if not memguard_is_active(cluster, nodes, node):
+                return (
+                    None,
+                    None,
+                    f"{node['name']}: pre-armed startup memguard is not active; "
+                    "refusing launch",
+                )
+            result = run_ssh(nodes, node, *launch_command(cluster, node, config_relative))
+            if result.returncode:
+                detail = result.stderr.strip() or result.stdout.strip()
+                return None, None, f"{node['name']}: launch failed: {detail}"
+            return (
+                node,
+                f"{node['name']}: launched {result.stdout.strip()} ({elapsed()})",
+                None,
+            )
+
+        for batch in (order[:-1], order[-1:]):
+            if not batch:
+                continue
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as pool:
+                launch_outcomes = list(pool.map(launch_node, batch))
+            launch_errors = []
+            for launched_node, message, error in launch_outcomes:
+                if launched_node is not None:
+                    started.append(launched_node)
+                if message is not None:
+                    print(message, flush=True)
+                if error is not None:
+                    launch_errors.append(error)
+            if launch_errors:
+                raise RuntimeError("; ".join(launch_errors))
+        wait_for_api(cluster, nodes)
+        print(f"API ready at {elapsed()}", flush=True)
+        start_memguards(cluster, nodes, "steady")
+    except (RuntimeError, KeyboardInterrupt) as error:
+        detail = str(error) if str(error) else "cluster start interrupted"
+        print(f"ERROR: {detail}", file=sys.stderr)
+        log_directory = preserve_failed_start_logs(
+            cluster, nodes, started, config_relative
+        )
+        if log_directory is not None:
+            print(
+                f"preserved complete failed-start logs in "
+                f"{log_directory.relative_to(ROOT)}",
+                file=sys.stderr,
+            )
+        print("rolling back containers started by this command", file=sys.stderr)
+        restore_containers(cluster, nodes, backups, started)
+        if backups:
+            try:
+                wait_for_api(cluster, nodes)
+                start_memguards(cluster, nodes, "steady")
+            except RuntimeError as rollback_error:
+                print(f"WARN: rollback health check failed: {rollback_error}", file=sys.stderr)
+        return 130 if isinstance(error, KeyboardInterrupt) else 1
+
+    def remove_backup(node: dict) -> str | None:
+        backup = backups.get(node["name"])
+        if backup and run_ssh(nodes, node, "docker", "rm", backup).returncode:
+            return f"WARN: {node['name']}: retained backup container {backup}"
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+        for warning in pool.map(remove_backup, nodes["nodes"]):
+            if warning:
+                print(warning)
+    print(f"cluster ready; memory guards are active on all nodes ({elapsed()})")
+    return 0
+
+
+def command_cluster_stop(args: argparse.Namespace) -> int:
+    require_named_profile(args)
+    cluster, nodes, _ = configuration(args)
+    name = cluster["container"]["name"]
+    action = "stop and remove" if args.remove else "stop"
+    covered = engine_shape(expected_command(cluster, head_node(nodes)))["nodes"]
+    refusal = None
+    try:
+        live = live_engine(cluster, nodes)
+        print(f"live: {describe_live(live)}")
+        if live and live["running"] and live["shape"]["nodes"] != covered:
+            refusal = (f"the running engine spans {live['shape']['nodes']} nodes and this profile covers "
+                       f"{covered}; stopping only these would leave the rest on a broken engine. Stop it with "
+                       f"its own profile: {stop_own_profile(live)}")
+    except RuntimeError as error:
+        # Stopping is the safe direction: an unreachable head does not block it.
+        print(f"WARN: {error}")
+    for node in nodes["nodes"]:
+        print(f"{node['name']}: {action} exact container {name} and stop its memguard")
+    if not args.apply:
+        if refusal:
+            print(f"--apply would refuse: {refusal}")
+        print("plan only; pass --apply to stop the cluster")
+        return 0
+    if refusal:
+        print(f"ERROR: {refusal}", file=sys.stderr)
+        return 1
+
+    def stop_node(node: dict) -> tuple[list[str], list[str]]:
+        """Stop one node's memguard and container; return (messages, errors)."""
+        guard = stop_memguard(cluster, nodes, node)
+        if memguard_is_active(cluster, nodes, node):
+            detail = guard.stderr.strip() or "unit remains active"
+            return [], [f"{node['name']}: could not stop memguard: {detail}"]
+        exists = run_ssh(nodes, node, "docker", "inspect", name)
+        if exists.returncode:
+            return [f"{node['name']}: {name} is already absent"], []
+        stopped = run_ssh(nodes, node, "docker", "stop", "--time", "60", name)
+        if stopped.returncode:
+            return [], [f"{node['name']}: {stopped.stderr.strip()}"]
+        if args.remove:
+            removed = run_ssh(nodes, node, "docker", "rm", name)
+            if removed.returncode:
+                return [], [f"{node['name']}: {removed.stderr.strip()}"]
+        return [], []
+
+    if getattr(args, "parallel", False):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+            outcomes = list(pool.map(stop_node, nodes["nodes"]))
+    else:
+        outcomes = [stop_node(node) for node in nodes["nodes"]]
+    failed = False
+    for messages, errors in outcomes:
+        for message in messages:
+            print(message)
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+            failed = True
+    return int(failed)
+
+
+# The nodes' long-lived JIT caches: the directories the profile's environment names under
+# the container's cache mount. They outlive the image that filled them, so `cache status`
+# shows what each node holds and `cache clear` empties them on every node.
+CACHE_MOUNT = "/cache"
+JIT_CACHES = {
+    "tilelang": ("TILELANG_CACHE_DIR",),
+    "nv-compute": ("CUDA_CACHE_PATH",),
+    "triton": ("TRITON_CACHE_DIR",),
+    "vllm": ("VLLM_CACHE_ROOT", "VLLM_CACHE_DIR"),
+}
+# Shown by `cache status` only: it holds the caches above and whatever else the engine
+# keeps beside them, so `cache clear` never takes it whole.
+JIT_CACHE_PARENT = {"xdg": ("XDG_CACHE_HOME",)}
+# The files below the current directory as "files, bytes, oldest, newest" (modification
+# times in epoch seconds), tab-separated: one line of size and time a file, summed by awk.
+CACHE_SUMMARY_AWK = (
+    "{ files += 1; bytes += $1; if (files == 1 || $2 < oldest) oldest = $2; "
+    "if (files == 1 || $2 > newest) newest = $2 } "
+    'END { printf "%d\\t%.0f\\t%.0f\\t%.0f", files, bytes, oldest, newest }'
+)
+CACHE_SUMMARY = f"find . -type f -printf '%s %T@\\n' 2>/dev/null | awk {shlex.quote(CACHE_SUMMARY_AWK)}"
+
+
+def cache_mount_source(cluster: dict) -> str:
+    """The node directory the profile mounts at the container's cache mount."""
+    sources = [str(source) for source, target, _ in cluster["container"]["mounts"]
+               if str(target).rstrip("/") == CACHE_MOUNT]
+    if len(sources) != 1:
+        raise ValueError(f"the profile mounts {len(sources)} directories at {CACHE_MOUNT}, not one")
+    source = PurePosixPath(host_path(cluster, sources[0]))
+    if not source.is_absolute() or ".." in source.parts or len(source.parts) < 2:
+        raise ValueError(f"the {CACHE_MOUNT} mount's source {str(source)!r} is not a directory of the node")
+    return str(source)
+
+
+def cache_host_directory(cluster: dict, container_path: str) -> str:
+    """The node directory behind a container path strictly inside the cache mount.
+
+    Every path `cache clear` empties passes through here. The path must be absolute, name
+    no `..`, and lie at least two directories below the mount: never the mount itself, nor
+    a directory right under it, which other state shares. No other mount may cover it,
+    because its files would then live elsewhere. Anything else raises ValueError."""
+    path = PurePosixPath(container_path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"{container_path!r} is not an absolute path without '..'")
+    try:
+        below = path.relative_to(CACHE_MOUNT)
+    except ValueError:
+        raise ValueError(f"{container_path!r} is not under the {CACHE_MOUNT} mount") from None
+    if len(below.parts) < 2:
+        raise ValueError(f"{container_path!r} is not at least two directories below the {CACHE_MOUNT} mount")
+    for _, target, _ in cluster["container"]["mounts"]:
+        other = PurePosixPath(str(target))
+        if other != PurePosixPath(CACHE_MOUNT) and (other == path or other in path.parents):
+            raise ValueError(f"{container_path!r} is under another mount, {target}")
+    return str(PurePosixPath(cache_mount_source(cluster)) / below)
+
+
+def profile_caches(cluster: dict, caches: dict[str, tuple[str, ...]]) -> tuple[list[dict], list[str], list[str]]:
+    """The node directories of the named caches, as the profile's environment sets them:
+    the directories, a note for each cache the profile does not set, and each value the
+    path guard refuses."""
+    environment = cluster.get("environment", {})
+    directories, unset, refused = [], [], []
+    for name, variables in caches.items():
+        values: dict[str, list[str]] = {}
+        for variable in variables:
+            if environment.get(variable):
+                values.setdefault(str(environment[variable]), []).append(variable)
+        if not values:
+            unset.append(f"{name}: the profile sets no {' or '.join(variables)}; skipped")
+        for value, named in values.items():
+            try:
+                host = cache_host_directory(cluster, value)
+            except ValueError as error:
+                refused.append(f"{name}: {', '.join(named)}={value}: {error}")
+                continue
+            directories.append({"name": name, "variables": named, "container": value, "host": host})
+    return directories, unset, refused
+
+
+def serving_containers_command(cluster: dict) -> str:
+    """List a node's running serving containers, each with the profile it was started from."""
+    return shlex.join(["docker", "ps", *serving_filters(cluster), "--format",
+                       f'{{{{.Names}}}}={{{{.Label "{PROFILE_LABEL}"}}}}'])
+
+
+def cache_survey_script(cluster: dict, directories: list[dict], *, containers: bool) -> str:
+    """One read-only remote script: each directory's presence, files, bytes and oldest and
+    newest file time, TileLang's kernel and binary entries, and (for a clear) the running
+    serving containers."""
+    # The container writes the caches as root, and some (nv-compute) are closed to everyone
+    # else: such a directory is read through `sudo -n`, and reported unreadable without it.
+    as_root = shlex.quote(f'cd -- "$1" && {CACHE_SUMMARY}')
+    lines = ["summary() { if [ -r \"$1\" ] && [ -x \"$1\" ]; then "
+             f"(cd -- \"$1\" && {CACHE_SUMMARY}); else "
+             f"sudo -n sh -c {as_root} sh \"$1\" 2>/dev/null || printf unreadable; fi; }}"]
+    if containers:
+        lines.append(f"names=$({serving_containers_command(cluster)} 2>&1); status=$?")
+        lines.append("printf 'containers\\t%s\\t%s\\n' \"$status\" \"$(printf '%s' \"$names\" | tr '\\n' ' ')\"")
+    for index, directory in enumerate(directories):
+        lines.append(f"d={shlex.quote(directory['host'])}")
+        lines.append(f"if [ -d \"$d\" ]; then printf 'cache\\t{index}\\tpresent\\t%s\\n' \"$(summary \"$d\")\"; "
+                     f"else printf 'cache\\t{index}\\tabsent\\n'; fi")
+        if directory["name"] == "tilelang":
+            lines.append(
+                'for sub in "$d"/*/linux-*/kernels "$d"/*/cuda-binaries; do [ -d "$sub" ] || continue; '
+                f"printf 'entries\\t{index}\\t%s\\t%s\\n' \"${{sub#\"$d\"/}}\" "
+                '"$(find "$sub" -mindepth 1 -maxdepth 1 | wc -l)"; done')
+    return "\n".join(lines) + "\n"
+
+
+def parse_cache_survey(text: str, count: int) -> dict:
+    """A survey's output: `caches` (one record per directory, in order), and `running`
+    ((container, profile) pairs) or `docker_error` when the script listed containers."""
+    caches: list[dict | None] = [None] * count
+    found: dict = {"caches": caches, "running": None, "docker_error": None}
+    for line in text.splitlines():
+        fields = line.split("\t")
+        try:
+            if fields[0] == "containers":
+                if fields[1] == "0":
+                    found["running"] = [(name, profile or None) for name, _, profile in
+                                        (item.partition("=") for item in fields[2].split())]
+                else:
+                    found["docker_error"] = fields[2].strip() or f"docker ps exited {fields[1]}"
+            elif fields[0] == "cache" and fields[2] == "absent":
+                caches[int(fields[1])] = {"present": False, "entries": []}
+            elif fields[0] == "cache" and fields[3:] == ["unreadable"]:
+                caches[int(fields[1])] = {"present": True, "unreadable": True, "entries": []}
+            elif fields[0] == "cache":
+                files, size, oldest, newest = (int(value) for value in fields[3:7])
+                caches[int(fields[1])] = {"present": True, "files": files, "bytes": size,
+                                          "oldest": oldest, "newest": newest, "entries": []}
+            elif fields[0] == "entries":
+                caches[int(fields[1])]["entries"].append((fields[2], int(fields[3])))
+        except (IndexError, ValueError, TypeError) as error:
+            raise ValueError(f"unreadable line {line!r}") from error
+    if None in caches:
+        raise ValueError("the node did not report every cache directory")
+    return found
+
+
+def survey_caches(cluster: dict, nodes: dict, directories: list[dict], *,
+                  containers: bool) -> list[tuple[dict | None, str | None]]:
+    """Every node's survey, the nodes concurrently and in node order: one remote call a
+    node, and (None, why) for a node that cannot be reached or read."""
+    script = cache_survey_script(cluster, directories, containers=containers)
+
+    def one(node: dict) -> tuple[dict | None, str | None]:
+        result = remote_shell(nodes, node, script)
+        if result.returncode == 255:
+            return None, f"unreachable: {result.stderr.strip() or 'SSH failed'}"
+        if result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            return None, f"cannot inspect the caches: {detail}"
+        try:
+            return parse_cache_survey(result.stdout, len(directories)), None
+        except ValueError as error:
+            return None, f"cannot inspect the caches: {error}"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+        return list(pool.map(one, nodes["nodes"]))
+
+
+def cache_size_text(size: int) -> str:
+    for unit, scale in (("GiB", 2**30), ("MiB", 2**20), ("KiB", 2**10)):
+        if size >= scale:
+            return f"{size / scale:.1f} {unit}"
+    return f"{size} B"
+
+
+def cache_text(cache: dict) -> str:
+    if not cache["present"]:
+        return "absent"
+    if cache.get("unreadable"):
+        return "present, closed to the SSH user and sudo -n"
+    if not cache["files"]:
+        return "present, no files"
+    oldest, newest = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(cache[key])) for key in ("oldest", "newest"))
+    return (f"{cache_size_text(cache['bytes'])} in {cache['files']:,} files, "
+            f"modified {oldest} to {newest}")
+
+
+def command_cache_status(args: argparse.Namespace) -> int:
+    cluster, nodes, _ = configuration(args)
+    _, config_relative = cluster_config_path(args)
+    directories, unset, refused = profile_caches(cluster, {**JIT_CACHES, **JIT_CACHE_PARENT})
+    print(f"profile: {config_relative} on {', '.join(node['name'] for node in nodes['nodes'])}")
+    for directory in directories:
+        parent = " (shown only; cache clear does not empty it)" if directory["name"] in JIT_CACHE_PARENT else ""
+        print(f"{directory['name']}: {', '.join(directory['variables'])}={directory['container']}{parent}")
+    for note in unset:
+        print(note)
+    for problem in refused:
+        print(f"ERROR: {problem}", file=sys.stderr)
+    failed = bool(refused)
+    if not directories:
+        return int(failed)
+    surveys = survey_caches(cluster, nodes, directories, containers=False)
+    for node, (found, problem) in zip(nodes["nodes"], surveys):
+        if problem:
+            print(f"ERROR: {node['name']}: {problem}", file=sys.stderr)
+            failed = True
+            continue
+        print(f"{node['name']}:")
+        for directory, cache in zip(directories, found["caches"]):
+            print(f"  {directory['name']}: {directory['host']}: {cache_text(cache)}")
+            for relative, count in cache["entries"]:
+                print(f"    {relative}: {count:,} entries")
+    return int(failed)
+
+
+def cache_clear_script(cluster: dict, directory: dict) -> str:
+    """Empty one cache directory on a node and keep the directory itself: the engine expects
+    it, and it may be a mount point.
+
+    The script deletes only below the directory's resolved path, and only when that path
+    lies at least two levels inside the cache mount's own directory, so no empty variable,
+    missing directory or symbolic link can point it anywhere else. It refuses while a
+    serving container runs on the node. The container writes the caches as root, and
+    closes some to everyone else: what the SSH user cannot enter or remove goes through
+    `sudo -n`."""
+    return "\n".join([
+        "set -u",
+        f"dir={shlex.quote(directory['host'])}",
+        f"root={shlex.quote(cache_mount_source(cluster))}",
+        f"running=$({serving_containers_command(cluster)}) || "
+        "{ echo 'cannot list the running containers' >&2; exit 3; }",
+        "[ -z \"$running\" ] || { echo \"a serving container is running: $running\" >&2; exit 3; }",
+        "[ -e \"$dir\" ] || { echo absent; exit 0; }",
+        "root=$(cd -- \"$root\" && pwd -P) || exit 4",
+        "if [ -r \"$dir\" ] && [ -x \"$dir\" ]; then as_root=; else as_root='sudo -n'; fi",
+        "real=$($as_root sh -c 'cd -- \"$1\" && pwd -P' sh \"$dir\") || "
+        "{ echo \"cannot enter $dir\" >&2; exit 4; }",
+        "case \"$real\" in \"$root\"/*/*) ;; "
+        "*) echo \"$dir resolves to $real, not a cache directory of $root\" >&2; exit 4 ;; esac",
+        f"summary=$($as_root sh -c {shlex.quote(f'cd -- "$1" && {CACHE_SUMMARY}')} sh \"$real\")",
+        "$as_root find \"$real\" -mindepth 1 -delete 2>/dev/null",
+        "if [ -n \"$($as_root find \"$real\" -mindepth 1 -print -quit 2>/dev/null)\" ]; then "
+        "sudo -n find \"$real\" -mindepth 1 -delete || "
+        "{ echo 'sudo -n could not remove the files the SSH user cannot' >&2; exit 5; }; fi",
+        "[ -z \"$(sudo -n find \"$real\" -mindepth 1 -print -quit 2>/dev/null || "
+        "find \"$real\" -mindepth 1 -print -quit)\" ] || { echo 'files remain' >&2; exit 5; }",
+        "printf 'removed\\t%s\\n' \"$summary\"",
+    ]) + "\n"
+
+
+def command_cache_clear(args: argparse.Namespace) -> int:
+    require_named_profile(args)
+    cluster, nodes, _ = configuration(args)
+    _, config_relative = cluster_config_path(args)
+    selected = list(dict.fromkeys(getattr(args, "only", None) or JIT_CACHES))
+    directories, unset, refused = profile_caches(cluster, {name: JIT_CACHES[name] for name in selected})
+    print(f"profile: {config_relative} on {', '.join(node['name'] for node in nodes['nodes'])}")
+    for note in unset:
+        print(note)
+    if refused:
+        for problem in refused:
+            print(f"ERROR: {problem}", file=sys.stderr)
+        return 1
+    if not directories:
+        print("nothing to clear: the profile names none of the selected caches")
+        return 0
+
+    # A clear covers every configured node or none, so every node is read before any is changed.
+    surveys = survey_caches(cluster, nodes, directories, containers=True)
+    refusals: list[str] = []
+    engines: dict[tuple[str, str | None], list[str]] = {}
+    for node, (found, problem) in zip(nodes["nodes"], surveys):
+        if problem:
+            refusals.append(f"{node['name']}: {problem}; a clear covers every configured node or none")
+            continue
+        for directory, cache in zip(directories, found["caches"]):
+            print(f"{node['name']}: empty {directory['host']} ({directory['name']}: {cache_text(cache)})")
+        if found["running"] is None:
+            detail = docker_error_detail(node["name"], found["docker_error"] or "no container listing")
+            refusals.append(f"{node['name']}: cannot tell whether an engine is running: {detail}")
+        for engine in found["running"] or []:
+            engines.setdefault(engine, []).append(node["name"])
+    for (container, profile), where in engines.items():
+        refusals.append(
+            f"{container} is running on {', '.join(where)}, and a running engine has frozen its kernel set "
+            f"against these caches; cluster stop comes first: {stop_own_profile({'profile': profile})}")
+    if not args.apply:
+        for refusal in refusals:
+            print(f"--apply would refuse: {refusal}")
+        print("plan only; pass --apply to clear the caches")
+        return 0
+    if refusals:
+        for refusal in refusals:
+            print(f"ERROR: {refusal}", file=sys.stderr)
+        print("nothing was cleared on any node", file=sys.stderr)
+        return 1
+
+    def clear_node(node: dict) -> tuple[list[str], list[str]]:
+        """Empty one node's directories; return (messages, errors)."""
+        messages, errors = [], []
+        for directory in directories:
+            where = f"{node['name']}: {directory['host']} ({directory['name']})"
+            result = remote_shell(nodes, node, cache_clear_script(cluster, directory))
+            removed = re.search(r"^removed\t(\d+)\t(\d+)\t", result.stdout, re.MULTILINE)
+            if result.returncode == 0 and removed:
+                files, size = int(removed.group(1)), int(removed.group(2))
+                messages.append(f"{where}: removed {files:,} files, {cache_size_text(size)}")
+            elif result.returncode == 0 and "absent" in result.stdout.split():
+                messages.append(f"{where}: absent, nothing to remove")
+            else:
+                detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+                errors.append(f"{where}: not cleared: {detail}")
+        return messages, errors
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+        outcomes = list(pool.map(clear_node, nodes["nodes"]))
+    failed = False
+    for messages, errors in outcomes:
+        for message in messages:
+            print(message)
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+            failed = True
+    return int(failed)
+
+
+def command_render(args: argparse.Namespace) -> int:
+    cluster, nodes, _ = configuration(args)
+    node = node_by_name(nodes, args.node)
+    print(shlex.join(rendered_docker_command(cluster, node)))
+    return 0

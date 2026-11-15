@@ -50,13 +50,20 @@ repository. Every one is an error unless marked **warn**.
 | Kernel backend | `--attention-backend`, `--linear-backend`, `--moe-backend`, the drafter's attention backend or `VLLM_DS41_KERNEL_BACKEND` disagree with `kernel_backend` (absent means B12X); a TileLang configuration omits `VLLM_DS41_KERNEL_BACKEND` while its vLLM series has the switch, or sets it once the series records `tilelang-only` (the switch is gone) |
 | Baseline | the configuration and the lock name different baselines |
 | Benchmark reference | a `benchmark_reference` is set but is not a repository-relative path to an existing report, or that report was measured on another node count, transport or `kernel_backend`; **warn** when the report does not record one of them |
-| Memory guards | a guard value is missing or not positive; the startup guard is not larger than the steady guard; `host.memguard_warn_gib` is not a non-negative integer, or is not 0 and not larger than the steady guard |
+| Memory guards | a guard value is missing or not positive; the startup guard is not larger than the steady guard; `host.memguard_warn_gib` is not a non-negative integer, or is not 0 and not larger than the steady guard; `host.defragment_before_start` is set but is not true or false |
 | Deployment | `repository`, `path`, `ready_url` or `ready_timeout_seconds` is empty; `launch_enabled` is not true or false |
 | Sources | a revision is not a full commit SHA; a tracking ref or upstream is missing; a patch series or patch file is missing; a patch set's fingerprint differs from the source manifest; TileLang is listed without TileKernels (or the reverse) |
 | Image identity | the image's expected tree labels do not match the source manifest; a sparknet transport runs on an image without sparknet; a sparknet configuration that pins no GID slot runs on a sparknet before 0.5.0 |
 | GLP steering | a `glp` field is malformed: `repo` is not `<owner>/<name>`, `revision` not a full commit SHA, `file` not a `.gguf` name, `sha256` not 64 hex digits; `glp.served_model_name` is not served exactly once after the first `--served-model-name` (the first is the stock model every tool and probe uses); `WEIGHTLESS_STEER_*` is set without a `glp` block |
 | Secrets | a tracked file is named `.env`, `id_rsa`, `id_ed25519` or `credentials.json`, or ends in `.pem`, `.key`, `.local.env` or `.local.json` |
 | Watchlist | **warn**: `docs/inspiration.md` is missing, or a watched reference is absent from it |
+
+A candidate whose vLLM manifest records `ds41-serving-contract` rejects
+`VLLM_DS41_ENGRAM_OVERLAP`, `VLLM_DS41_MARKOV_NVFP4` and
+`VLLM_DS41_DRAFT_NVFP4_HEAD`, including explicit `0` values. The first setting
+has no consumer; the NVFP4 head choices are kept as an unselected experiment.
+The candidate's vLLM startup rejects them too. Older frozen source recipes keep
+their own option support.
 
 Fix these in the repository; nothing on the nodes changes them.
 
@@ -82,6 +89,7 @@ revert it.
 | Unused desktop services | warn | Bluetooth, CUPS, snapd, fwupd's refresh timer and the DGX Dashboard hold memory; the dashboard's update checks peak near 850 MiB | `sudo systemctl disable --now …` (`scripts/host-recovery apply` does the same) |
 | NVMe interrupt coalescing off | warn | Engram's small direct disk reads wait for the coalescing timer | `sudo systemctl mask --now nvidia-nvme-interrupt-coalescing.service && sudo /usr/bin/nvidia-nvme-interrupt-coalescing.sh disable` |
 | NVMe APST: no sleep state of 5 ms or more to wake before 1 s idle, nor of 20 ms or more before 30 s | warn | the first Engram read after a pause waits for the drive to wake (11 ms from PS3, 46 ms from PS4) | `nvme_core apst_primary_timeout_ms=2000 apst_secondary_timeout_ms=60000` ([setup](setup.md#nvme-power-states-apst)) |
+| Onboard Wi-Fi radio off and control plane (`management_ip` / `control_ip`, `*_SOCKET_IFNAME`) not on a wireless interface | warn | the control plane sends packets every decode step; Wi-Fi tail latency stalls the step ([#712](https://github.com/christopherowen/spark-ds41f/issues/712)) | `sudo nmcli radio wifi off`, or move `control_ip` / `*_SOCKET_IFNAME` onto wired or ConnectX-7 links |
 | Fan-floor control: DKMS module (version 0.1.4), loaded module, cooling device | warn, first missing layer | `bin/spark bench` and kernel-lab jobs pre-cool through it; serving does not need it | the printed `dkms autoinstall` or `modprobe` command ([dgx-spark-fan-control](https://github.com/christopherowen/dgx-spark-fan-control)) |
 | `dgx-fan-control.service` installed | warn | `bin/spark bench` runs its performance curve while measuring and refuses to measure without it. Whether it also runs while serving is the site's choice and is not checked | the printed `install` and `daemon-reload` commands |
 
@@ -132,8 +140,15 @@ fixed to the old slot fails (NCCL with an unhandled system error).
 | Its image tag and vLLM command line equal the configuration's | error |
 | Its environment (`Config.Env`) equals the configuration's: each variable `cluster start` passes (the profile's `environment` plus the per-node values it adds) has its value, and every other variable is the container image's own with the image's value; an extra, missing or different variable fails | error |
 | Its bind mounts (`HostConfig.Binds`) equal the configuration's `container.mounts`; an extra, missing or different mount fails | error |
-| The image's source-tree labels equal the configuration's `expected_labels` | error |
+| The running container's immutable image has the configuration's `expected_labels` | error |
+| Every node's running image has the same ordered layer digests and runtime `Config` | error |
 | While serving, the GPU clock is at least 1,000 MHz | error; a lower clock is the [GB10 clock latch](recovery.md#gb10-gpu-clock-latch), cleared only by removing AC power |
+
+Image checks inspect the container's immutable image ID, so moving a tag cannot hide
+an old running build. Docker's containerd and overlay2 stores may assign different
+IDs to the same copied image; the layers and runtime configuration must still match.
+Benchmarks validate their own captured image inspections and record each node's
+image ID, layers, labels and content fingerprint alongside any validation errors.
 
 ### GLP steering file
 
@@ -142,6 +157,15 @@ block's pinned revision: vLLM reads it at startup and refuses to start without i
 The check runs whether or not the service is up. A missing or unreadable file, or
 one whose sha256 is not `glp.sha256`, is an error, and the error prints the
 `hf download` command for the pinned revision ([setup](setup.md#glp-steering-file)).
+
+On the head, the profile's image then reads the file with its own GLP reader
+(`python3 -m vllm.models.deepseek_v4_1.glp`), mounted at `/glp/vector.gguf` as the
+engine mounts it, in a `docker run --rm --pull=never --network=none` with no GPU.
+The engine reads the file while it builds the model, so a vector its reader refuses
+(another `glp.spec_version` or `glp.hook_point`, for example) would stop the whole
+engine, the stock model name included. A refusal is an error naming the image, the
+file's `glp.spec_version` and `glp.hook_point`, and the reader's reason. The check is
+skipped when the head lacks the image; the image checks report that.
 
 ### CPU pinning
 
@@ -182,7 +206,8 @@ a start cannot survive, on every node, and refuses to launch on any failure:
 - `bin/spark doctor` passes on the node itself;
 - every mount source exists (writable for read-write mounts);
 - the `glp` file, if the profile has one, is readable and has `glp.sha256`, with
-  its download command when it is not (above);
+  its download command when it is not, and the image's own GLP reader accepts it on
+  the head (above);
 - the image is present with the expected tree labels;
 - no container with the serving name exists unless you pass `--replace`;
 - passwordless `sudo` works (the memory guards need it).
@@ -192,6 +217,17 @@ the profile it was started from), the planned engine and whether the shape
 changes, and says when `--apply` would refuse; `--verbose` adds each rank's
 `docker run`. Each container is labelled `spark.cluster-config=<profile>`, so the
 next plan can name the profile that stops it.
+
+The plan also runs the checks above, which only read, so every problem `--apply`
+would stop on shows before it. When a node's checkout, profile or image differs
+from the head's, the list ends with the command that repairs them all:
+
+```
+fix: bin/spark --cluster-config <profile> cluster sync --apply gives every node this commit and its image
+```
+
+A profile that no commit carries (an ignored `*.local.json`) reaches no other
+node: commit and publish it.
 
 Then it arms a 5 GiB startup memory guard on every node before any container
 starts, starts the ranks, waits for the API, and switches to the 3 GiB steady

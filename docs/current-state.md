@@ -260,11 +260,11 @@ rollback.
 <!-- BEGIN GENERATED: active-settings -->
 | Setting | Active value |
 | --- | --- |
-| Promoted baseline | `2026-10-30-spark-ds41f-1030` (`spark-ds41f-1030`, frozen in `releases/spark-ds41f-1030/`); default shape `tp4-ring` |
+| Promoted baseline | `2026-11-07-spark-ds41f-1107` (`spark-ds41f-1107`, frozen in `releases/spark-ds41f-1107/`); default shape `tp4-ring` |
 | Served models | `deepseek-v4.1-flash` (`deepseek-ai/DeepSeek-V4.1-Flash-1017`, revision `1bae0e10`) and per-request GLP-steered `deepseek-v4.1-flash-weightless` (`msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75`, revision `2715ffd5`) |
-| Kernel backend | TileLang only (`kernel_backend: tilelang`, vLLM 0493-0496): TileLang 0.1.15 (`222b895d`), DeepSeek TileKernels 2.0.0 (`cb2fa41c`), sparknet 0.5.0 (`f997a594`) one-shot RoCE collectives; every serving kernel is TileLang including the vision tower, CED row selection, RoPE, compressor, KV writers, Engram gate/hash/gather, sparse MLA, WO projection, drafter context-KV, sampling and block verification |
-| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `19f2c20e` + `experiments/2026-10-26-spark-ds41f-candidate/rc14/vllm/series` (452 patches, patch head `b6de07aa`, tree `ea1281f8`), TileLang 0.1.15 (4 patches), TileKernels 2.0.0 (1 patch), sparknet 0.5.0, NCCL 2.30.7 (4 patches, tree `6af10aa7`); direct checkpoint loader (`--load-format direct`, vLLM 0499, `VLLM_PLUGINS` empty) |
-| Image | `spark-ds41f:1030` (built as `spark-ds41f:19f2c20ed4d6-next-14`, `sha256:7918fd6145b5`), one digest on all ranks, built by `bin/spark build` |
+| Kernel backend | TileLang only (`kernel_backend: tilelang`, vLLM 0493-0496): TileLang 0.1.15+snapshot.35f15411cf3af0fc06a1cb0097215b1372a40464 (`e2b00182`), DeepSeek TileKernels 2.0.0 (`cb2fa41c`), sparknet 0.5.0 (`8cc28a5c`) one-shot RoCE collectives; every serving kernel is TileLang including the vision tower, CED row selection, RoPE, compressor, KV writers, Engram gate/hash/gather, sparse MLA, WO projection, drafter context-KV, sampling and block verification |
+| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `19f2c20e` + `experiments/2026-10-26-spark-ds41f-candidate/1107/vllm/series` (641 patches, patch head `2756478b`, tree `ed1bdb7a`), TileLang 0.1.15+snapshot.35f15411cf3af0fc06a1cb0097215b1372a40464 (13 patches), TileKernels 2.0.0 (1 patch), sparknet 0.5.0, NCCL 2.30.7 (4 patches, tree `6af10aa7`); direct checkpoint loader (`--load-format direct`, vLLM 0499, `VLLM_PLUGINS` empty) |
+| Image | `spark-ds41f:1107` (built as `spark-ds41f:1107`, `sha256:3f32a962ce04`), one digest on all ranks, built by `bin/spark build` |
 | Decode tiles & PDL | block-32 FP8 decode rows on 16-, 32- or 64-row tiles by row count and split-K tiles up to 128 rows for 16-stream steps, programmatic dependent launch (PDL) along the decode chain (vLLM 0520-0525), attention front in one launch (0543-0544), 64-row prefill MoE tiles and panel rasterization past L2 (0043) |
 | Batch invariance | temperature-0 outputs do not depend on the batch: rank-order FP32 reductions with one rounding, compressor projection one TileLang arithmetic at every row count, aligned prefill chunks (`--long-prefill-token-threshold` 16,288 on `tp4-ring`, 6,096 on `tp3-triangle`, 4,048 on `tp3-triangle-4k`), CED replays a prompt's last 128 rows wherever its chunks end (0526-0527), and mixed steps run sparse MLA per request |
 | Hosts | DGX Spark 26.09.2 (dgx-spark-ota-update-meta), kernel `7.0.0-1019-nvidia-64k with kho=off`, driver 580.178.04, `multi-user.target (no desktop)`, `--cpuset-cpus=5-9,15-19`, glibc malloc pinned (`MALLOC_ARENA_MAX=2`, `MALLOC_MMAP_THRESHOLD_=1048576`) |
@@ -272,7 +272,7 @@ rollback.
 | Maximum model length | `tp4-ring` and `tp3-triangle`: 1,048,576 tokens; `tp3-triangle-4k`: 262,144 tokens |
 | Maximum sequences | `tp4-ring`: 16; `tp3-triangle` and `tp3-triangle-4k`: 8 |
 | Maximum parallel prefills | 1 (`--max-parallel-prefills 1`) |
-| Batched-token budget | `tp4-ring`: 16,384; `tp3-triangle`: 6,144 (qualified on `spark-ds41f-1030`); `tp3-triangle-4k`: 4,096 |
+| Batched-token budget | `tp4-ring`: 16,384; `tp3-triangle`: 6,144 (qualified on `spark-ds41f-1107`); `tp3-triangle-4k`: 4,096 |
 | Prefill yield & late admission | prefill yield enabled (`--prefill-yield short`, `--prefill-yield-limit-s 10`, vLLM 0545) so waiting short requests take the next step from a long prefill; late admission at decoder layer 30 (`VLLM_LATE_ADMISSION_LAYER=30`, vLLM 0222, 0226) |
 | Prefill sequence parallelism | from 205 tokens, where the reduce-scatter exceeds the one-shot RoCE all-reduce; CED encoder layers with non-final row skip (vLLM 0014-0018, 0229-0255) |
 | Indexer under sequence parallelism | each rank scores and selects its own rows and all-gathers the top-k positions (patch 0025), ties broken by lowest logical position in TileLang |
@@ -283,7 +283,7 @@ rollback.
 | Page-size profiles | 64 KiB selected (`tp4-ring`, `tp3-triangle`); 4 KiB (`tp3-triangle-4k`) retains 2.2 GiB KV and a 262,144-token limit |
 | Output head & display carve-out | exact 12-bit packed BF16 (`VLLM_DS41_PACKED_BF16_LM_HEAD=1`), bit-identical to the checkpoint, with FP32 logits (`VLLM_DS41_HEAD_DTYPE=float32`); kept in regular memory on `tp4-ring` (`SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=0`) and in the GB10 display carve-out on `tp3-triangle` (`=1`) |
 | Reference precision | DeepSeek's `inference/model.py` term for term: FP32 logits, exact FP32 mHC stream projection (three TF32 parts per weight), shared expert SwiGLU in FP32 with one rounding, MoE partials rounded once per rank, and WO-A's input through `act_quant` (E4M3, UE8M0 per 32, vLLM 0177, 0179) |
-| Image input | TileLang vision tower loaded (`--limit-mm-per-prompt '{"image":8}'`, `VLLM_MAX_IMAGE_PIXELS=16777216`, `--mm-processor-cache-gb 0`; [below](#images-per-request)) |
+| Image input | TileLang vision tower loaded (`--limit-mm-per-prompt '{"image":67}'`, `VLLM_MAX_IMAGE_PIXELS=16777216`, `--mm-processor-cache-gb 0`; [below](#images-per-request)) |
 | DSpark speculative decoding | 5 draft tokens, draft TP = node count, fixed linear step cost budget (`adaptive_verification_row_cost: 0.035`, vLLM 0184, nothing timed at boot), dead verification rows below survival 0.2 (`0504`), block rejection with fresh draws per round (`0228`), sink draft-zero rejection on by default (`0221, 0223`), vocabulary-parallel greedy drafts and shard argmax verification (`0112-0114`) |
 | Collectives | sparknet 0.5.0 one-shot RoCE all-reduce (up to 2 MiB) and all-gather (`oneshot-ring4` on TP4, `oneshot-direct` on TP3), TP broadcast on one-shot all-gather (`0185`), GPU-clock timeout 10 s (`SPARKNET_ROCE_TIMEOUT_MS=10000`), no fallback (`0142`) |
 | CUDA graphs & warmup | `FULL_AND_PIECEWISE`, capture sizes 1-96 on `tp4-ring` (1-48 on `tp3-triangle`); all declared TileLang calls prepared and cache frozen before memory profiling (`--jit-monitor-mode off`) |
@@ -304,14 +304,18 @@ memory guards are unchanged.
 
 ## Images per request
 
-`--limit-mm-per-prompt {"image":8}` in the recipe's `serve_args` is the recipe's chosen
-per-request limit, raised from four on 2026-11-03 by the owner. It is not a
-limit of the model. vLLM counts every image in a request, and a chat client resends its
-history, so the images retained in earlier turns count too: once a conversation holds a
-ninth image, every later turn fails with
-`400: At most 8 image(s) may be provided in one prompt`.
+`--limit-mm-per-prompt {"image":67}` is the current default per-request limit,
+requested by the owner on 2026-11-04. It counts every image in a request,
+including images a chat client resends with conversation history. Requests
+with more than 67 images receive
+`400: At most 67 image(s) may be provided in one prompt`.
 
-A site profile raises the limit by writing another count in that entry (`{"image":16}`), or
+The [default-change record](../manifests/runtime-defaults/2026-11-04-images-67.json)
+preserves the distinction from the frozen spark-ds41f-1030 recipe, which used
+four images. Historical qualification and memory observations below retain
+that original count; 67 has not been serving-qualified here.
+
+A site profile raises the limit by writing another count in that entry (`{"image":80}`), or
 omits both entries to take vLLM's default of 999 per prompt. `{"image":0}` (or
 `--language-model-only`) skips the vision tower and its 0.9 GiB of weights on every rank.
 A profile's `serve_args` is the complete command, so the change is made in the profile's
@@ -320,18 +324,12 @@ own list ([setup.md](setup.md#a-site-profile-replaces-serve_args-wholesale)).
 The trade-off is memory per request, not at startup. The tower's weights load whenever
 images are allowed at all, and vLLM encodes a request's images within a per-step budget
 derived from the batched-token budget (6,144 tokens on the triangle, 16,384 on the ring), so
-the encoder's working memory per step does not grow with the count, and the startup profile
-`min(budget / 1,024, 8 streams x cap)` stays at the budget bound at a cap of eight as it did
-at four. The request does: every image becomes prompt tokens that hold blocks of the fixed KV
-pool (`kv_cache_memory_bytes`)
+the encoder's working memory per step does not grow with the count. The request does: every
+image becomes prompt tokens that hold blocks of the fixed KV pool (`kv_cache_memory_bytes`)
 for the life of the request, beside every other stream's context, and lengthen its
 prefill; and the head's API server decodes and preprocesses every image in host memory,
-which on GB10 is the unified memory dgx1's steady guard watches. Eight is not yet qualified
-on the cluster: the 4, 8, 16 and 32-image sweep over 1, 4 and 8 streams is written
-([experiments/2026-10-26-site-landmines](../experiments/2026-10-26-site-landmines/README.md))
-but has not run, so the count rests on the pixel bound below and on the host-side figures
-taken there (8 requests of 8 12 MP photos: 4.1 GiB; 8 requests of 32 token-max images:
-4.7 GiB).
+which on GB10 is the unified memory dgx1's steady guard watches. No count above four is
+qualified here.
 
 **Pixels per image: at most 16,777,216** (`VLLM_MAX_IMAGE_PIXELS` in the recipe, since
 2026-10-25). vLLM decodes every image at its source size before DS4.1 resizes it to about
@@ -339,20 +337,19 @@ taken there (8 requests of 8 12 MP photos: 4.1 GiB; 8 requests of 32 token-max i
 on the 1025 image (experiments/2026-10-26-site-landmines):
 - **Per image in flight:** about 19 MiB at 1,302 px, 61-74 MiB for a 12 MP photo, 310 MiB at
   48 MP, and 790 MiB at vLLM's default ceiling of 178.9 MP.
-- **The danger at the default:** four images at that ceiling peaked at 5.2 GiB (JPEG) and
+- **Measured at the former four-image default:** four images at that ceiling peaked at 5.2 GiB (JPEG) and
   8.4 GiB (PNG with alpha). dgx1 serves the triangle with about 4.4 GiB above its 3 GiB
   guard, so one such request could stop the service.
 
 The model never sees more than about 1.7 MP, so a 16 MP limit changes nothing for ordinary
 images. Larger photos, such as 48 MP phone originals, get a 400 before decoding: vLLM reads
-the dimensions from the header and refuses the image before any pixel is decoded. The pixel
-bound, not the count, holds the host cost of a request near 8 x 200 MiB of peak; the sweep
-above is what would state the count's own margin.
+the dimensions from the header and refuses the image before any pixel is decoded. A higher
+per-request image count waits for its own measurement.
 
 Externally reported, not qualified here: a three-node TP3 site with the limit removed (r6
 image, 524,288-token context, eight sequences) completed a chat-history request with 13
 images and 104,615 prompt tokens, cold and warm, and three overlapping replays of it
-([#30](https://github.com/christopherowen/spark-ds41f/issues/30)). That shows more than eight
+([#30](https://github.com/christopherowen/spark-ds41f/issues/30)). That shows more than four
 working on that site, not that a given count is safe for every image size, workload or
 shape.
 

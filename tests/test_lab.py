@@ -20,36 +20,9 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader("lab", str(ROOT / "scripts" / "lab.py"))
-spec = importlib.util.spec_from_loader("lab", loader)
-lab = importlib.util.module_from_spec(spec)
-loader.exec_module(lab)
-# Host-independent: read the shipped example, not the site's git-ignored config/nodes.json.
-lab.spark.site_nodes = lambda: lab.spark.read_json("config/nodes.example.json")
-_real_configuration = lab.spark.configuration
-
-
-def _host_independent_configuration(args=None):
-    try:
-        return _real_configuration(args)
-    except (FileNotFoundError, SystemExit):
-        ring = lab.spark.read_json("config/examples/nodes-ring4.json")
-        head_ip = lab.spark.read_json("config/cluster.json")["distributed"]["master_addr"]
-        next(node for node in ring["nodes"] if node.get("head"))["management_ip"] = head_ip
-        ring_text = json.dumps(ring)
-        real_read_text = Path.read_text
-        with mock.patch.object(
-            Path,
-            "read_text",
-            autospec=True,
-            side_effect=lambda self, *a, **kw: (
-                ring_text if self == ROOT / "config/nodes-ring4.local.json" else real_read_text(self, *a, **kw)
-            ),
-        ):
-            return _real_configuration(args)
-
-
-lab.spark.configuration = _host_independent_configuration
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from spark_ds41f import lab
 # Never read or write the real hold and request files, even when the suite runs on dgx1.
 _STATE = tempfile.TemporaryDirectory()
 lab.HOLD = Path(_STATE.name) / "spark-hold.json"
@@ -229,17 +202,48 @@ class BootTimeTest(unittest.TestCase):
 
 
 SITE_SHAPE = mock.patch.object(lab.spark.cluster_recipe, "site_shape", return_value="tp3-triangle")
+SITE_NODES = mock.patch.object(
+    lab.spark, "site_nodes", side_effect=lambda: lab.spark.read_json("config/nodes.example.json")
+)
+_REAL_CONFIGURATION = lab.spark.configuration
+
+
+def _host_independent_configuration(args=None):
+    try:
+        return _REAL_CONFIGURATION(args)
+    except (FileNotFoundError, SystemExit):
+        ring = lab.spark.read_json("config/examples/nodes-ring4.json")
+        head_ip = lab.spark.read_json("config/cluster.json")["distributed"]["master_addr"]
+        next(node for node in ring["nodes"] if node.get("head"))["management_ip"] = head_ip
+        ring_text = json.dumps(ring)
+        real_read_text = Path.read_text
+        with mock.patch.object(
+            Path,
+            "read_text",
+            autospec=True,
+            side_effect=lambda self, *a, **kw: (
+                ring_text if self == ROOT / "config/nodes-ring4.local.json" else real_read_text(self, *a, **kw)
+            ),
+        ):
+            return _REAL_CONFIGURATION(args)
+
+
+SITE_CONFIGURATION = mock.patch.object(lab.spark, "configuration", side_effect=_host_independent_configuration)
 
 
 def setUpModule() -> None:
     # These tests ran against the default profile when it was TP3 on config/nodes.json;
     # the recipe resolves the same shape for them.
     SITE_SHAPE.start()
+    SITE_NODES.start()
+    SITE_CONFIGURATION.start()
 
 
 def tearDownModule() -> None:
     # pytest runs tearDownModule but not unittest's module cleanups, and a patch left
     # running would choose the site's shape for the modules after this one.
+    SITE_CONFIGURATION.stop()
+    SITE_NODES.stop()
     SITE_SHAPE.stop()
 
 
@@ -633,6 +637,14 @@ class PlanProblemsTest(unittest.TestCase):
         self.assertEqual(benches[1]["argv"][-2:], ["--corpus", "results/private/suites/s/cand/model.json.gz"])
         self.assertEqual(benches[0]["telemetry_out"], "results/private/determinism/s/suite-cand")
         self.assertEqual(steps[-1]["argv"], ["scripts/servebench_suite_table.py", "s", "cand", "base"])
+        self.assertTrue(all("fail_on_suite_error" not in step for step in benches))
+        spec["jobs"][0]["fail_on_suite_error"] = True
+        required = [step for step in lab.plan(spec) if step["kind"] == "cli"]
+        self.assertTrue(all(step["fail_on_suite_error"] is True for step in required))
+        spec["jobs"][0]["fail_on_suite_error"] = "yes"
+        with self.assertRaisesRegex(ValueError, "must be boolean"):
+            lab.plan(spec)
+        spec["jobs"][0].pop("fail_on_suite_error")
         spec["jobs"][0]["suite"] = "no-such-suite"
         with mock.patch.object(lab, "head_url", return_value="http://h:8000"):
             self.assertTrue(lab.plan_problems(lab.plan(spec)))
@@ -1228,6 +1240,32 @@ class TransferRouteTest(unittest.TestCase):
 
 
 class StepFailureTest(unittest.TestCase):
+    def test_required_suite_stops_before_another_suite_or_boot(self) -> None:
+        for required in (False, True):
+            with self.subTest(required=required), tempfile.TemporaryDirectory() as directory:
+                steps = [{"kind": "cli", "label": "first", "argv": ["bench"], "suite": "release-tp3",
+                          "fail_on_suite_error": required}, {"kind": "sync"}]
+                with mock.patch.object(lab, "ROOT", Path(directory)), \
+                        mock.patch.object(lab, "plan", return_value=steps), \
+                        mock.patch.object(lab, "read_hold", return_value={"holder": "test"}), \
+                        mock.patch.object(lab, "hold_is_ours", return_value=True), \
+                        mock.patch.object(lab, "window_should_close", return_value=None), \
+                        mock.patch.object(lab, "beat"), \
+                        mock.patch.object(lab, "production_configuration", return_value=({"host": {"home": "/h"}}, {}, {})), \
+                        mock.patch.object(lab, "plan_problems", return_value=[]), \
+                        mock.patch.object(lab, "Telemetry", return_value=contextlib.nullcontext()), \
+                        mock.patch.object(lab, "spark_cli", return_value=1), \
+                        mock.patch.object(lab, "save_engine_logs"), \
+                        mock.patch.object(lab, "sync_checkouts", return_value=True) as later, \
+                        mock.patch.object(lab, "checkout_commit", return_value=lab.COMMIT_AT_START), \
+                        mock.patch.object(lab, "window_close", return_value=True) as close, \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    code = lab.execute({"experiment": "experiments/x", "run": "r", "jobs": []},
+                                       dry=False, keep_open=True)
+                self.assertEqual(code, int(required))
+                self.assertEqual(later.call_count, int(not required))
+                self.assertEqual(close.call_count, int(required))
+
     def test_a_step_that_raises_fails_the_run_and_closes_the_window(self) -> None:
         spec = {"experiment": "experiments/2026-09-29-determinism", "run": "t0",
                 "jobs": [{"kind": "kernel", "bundles": [{"bundle": "b/mhc", "node": "dgx2"}]}]}

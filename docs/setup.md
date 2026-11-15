@@ -51,9 +51,13 @@ Each node needs:
   then reconnect);
 - about 480 GiB of free disk (the model, including Engram tables read from
   disk, plus caches); the build host also needs 64 GiB of free memory;
-- a management network for SSH, the API and Gloo, with passwordless SSH from
-  the head node to every node as one user, who also has passwordless `sudo`
-  (the memory guards and several checks use `sudo -n`);
+- a wired management network for SSH, the API and per-step control traffic
+  (Ray, Gloo and ZMQ; Wi-Fi tail spikes stall decode steps, see
+  [#712](https://github.com/christopherowen/spark-ds41f/issues/712), or set
+  `control_ip` / `*_SOCKET_IFNAME` to route control traffic over the
+  ConnectX-7 links when no RJ45 management network is cabled), with
+  passwordless SSH from the head node to every node as one user, who also has
+  passwordless `sudo` (the memory guards and several checks use `sudo -n`);
 - the ConnectX-7 cabling for its topology ([stage 3](#3-fabric-cabling-and-addressing)).
 
 ## What changes on your machines
@@ -91,7 +95,7 @@ Do the stages in order on every node, and keep the nodes identical:
 | 3 | [Fabric](#3-fabric-cabling-and-addressing) | 9000-byte pings on every path; one IPv4 RoCE v2 GID per port |
 | 4 | [Site configuration](#4-site-configuration) | `bin/spark doctor` |
 | 5 | [Model](#5-model) | the pinned revision on every node |
-| 6 | [Image](#6-image) | the same image (its layers) on every node |
+| 6 | [Image](#6-image) | the same image content (ordered layers and runtime configuration) on every node |
 | 7 | [First start](#7-first-start) | `bin/spark doctor --live` |
 | 8 | [Verify](#8-verify) | `bin/spark bench` |
 
@@ -471,7 +475,8 @@ clone it. A start refuses a read-write mount whose source a node cannot write
 should name `{checkout}` too.
 
 `bin/spark --cluster-config <profile> cluster sync --apply` moves every node's checkout to the head's
-commit and copies the head's node map to the others.
+commit, copies the head's node map to the others, and copies the profile's image from the head to
+every node whose ordered image layers or runtime configuration differ.
 
 Commands that change the nodes need the configuration named with
 `--cluster-config` before the subcommand, for example
@@ -485,15 +490,15 @@ list does not merge with the recipe's, it replaces it. Copying
 list, including the recipe's per-prompt image cap:
 
 ```
---limit-mm-per-prompt '{"image":8}'
+--limit-mm-per-prompt '{"image":67}'
 ```
 
-Eight is the recipe's chosen per-request limit, not a limit of the model, and
+67 is the recipe's chosen per-request limit, not a limit of the model, and
 it counts the images a chat client resends with its history. A site that
-serves more than eight images in one prompt gets, on every such request:
+serves more than 67 images in one prompt gets, on every such request:
 
 ```
-400: At most 8 image(s) may be provided in one prompt (parameter=image)
+400: At most 67 image(s) may be provided in one prompt (parameter=image)
 ```
 
 Write another count in that entry to raise the cap, or remove both list
@@ -570,8 +575,9 @@ The file is 803,392 bytes, sha256
 `9c66d47701e0ceb42c33906f2d3789c0f1f16b21e7d97185f20f7f3f09fbf5cf`. A node without a
 token can take a copy from another node instead: the snapshot path and the
 `hub/blobs` file it links to. `bin/spark doctor --live` and the launch preflight
-report a node whose file is missing or differs, with this command
-([doctor](doctor.md#glp-steering-file)).
+report a node whose file is missing or differs, with this command, and run the
+image's own GLP reader on the head's copy, so a vector the image cannot read is
+refused before a boot ([doctor](doctor.md#glp-steering-file)).
 
 ## 6. Image
 
@@ -590,15 +596,19 @@ an existing tag, and runs a GPU import smoke test. The first build takes
 longer because it builds TileLang and TileKernels. More detail is in
 [docker/README.md](../docker/README.md).
 
-Copy the image to the other nodes in your node map and confirm the same image layers everywhere:
+`cluster sync` (step 7) copies the image to the other nodes in your node map and checks that
+every node has the same image content. To copy it without a sync, or to copy another tag:
 
 ```sh
 bin/spark --cluster-config config/cluster.json build distribute --apply
 ```
 
-Compare the layers, not the image ID: a node on Docker's containerd image store names an image
+Compare ordered layers and runtime configuration: a node on Docker's containerd image store names an image
 by its manifest and an `overlay2` node by its config, so a faithful copy between the two shows
-a different ID (#488). The layers are the same on every node whatever its storage.
+a different ID (#488). A faithful copy preserves the ordered layers and runtime configuration
+on every node whatever its storage. Matching layers alone is insufficient: labels,
+environment or entrypoint can differ while the filesystem stays the same. A missing image
+can be copied; failed or malformed inspections stop distribution instead of authorizing it.
 Your image differs from ours because the image records the deployment
 commit. The source-tree labels must match the profile's `expected_labels`;
 `doctor --live` and the launch preflight check them.
@@ -636,6 +646,20 @@ Stop: `bin/spark --cluster-config <profile> cluster stop --apply`, with the
 profile the engine was started from (the plan names it). It stops the exact
 containers and their memory guards and keeps the containers for inspection. It
 refuses a profile that covers only some of the running engine's nodes.
+
+The JIT caches outlive the image that filled them. Inspect them on every node,
+and empty them once the engine is stopped:
+
+```sh
+bin/spark --cluster-config <profile> cache status
+bin/spark --cluster-config <profile> cache clear --apply
+```
+
+`cache clear` acts on the directories the profile's environment names under the
+`/cache` mount and keeps the directories themselves. It refuses unless every
+node of the profile can be reached and none runs a serving container. Without
+`--apply` it prints the plan; `--only tilelang` (or `nv-compute`, `triton`,
+`vllm`) clears one cache. The next start compiles the kernels again.
 
 ## 8. Verify
 
